@@ -154,6 +154,40 @@ class SORTTracker:
         self.iou_threshold = iou_threshold if iou_threshold is not None else settings.iou_threshold
         self.trackers: list[KalmanBoxTracker] = []
         self.frame_count = 0
+        self.frame_size: tuple[int, int] | None = None   # (W, H) для физ. gate
+
+    def set_frame_size(self, width: int, height: int) -> None:
+        self.frame_size = (width, height)
+
+    def _gate_cost(self, dets: np.ndarray, predicted_arr: np.ndarray) -> np.ndarray:
+        """Стоимостная матрица: -IoU для допустимых пар, +inf для запрещённых.
+
+        Пара детекция-трек отклоняется, если:
+          * центр предсказанного бокса трека вышел за кадр с запасом в его
+            ширину/высоту (сорванный трек улетает за границу по инерции);
+          * расстояние между центрами больше max_jump_frac * min(W, H)
+            (нефизичный скачок — вероятная ложная детекция).
+        """
+        iou = np.asarray(iou_batch(dets, predicted_arr), dtype=float)
+        cost = -iou                              # форма (n_det, n_trk)
+        dcx = (dets[:, 0] + dets[:, 2])[:, None] / 2.0
+        dcy = (dets[:, 1] + dets[:, 3])[:, None] / 2.0
+        tcx = (predicted_arr[None, :, 0] + predicted_arr[None, :, 2]) / 2.0
+        tcy = (predicted_arr[None, :, 1] + predicted_arr[None, :, 3]) / 2.0
+        dist = np.hypot(dcx - tcx, dcy - tcy)
+        if self.frame_size:
+            w_img, h_img = self.frame_size
+            limit = settings.max_jump_frac * min(w_img, h_img)
+            cost = np.where(dist > limit, np.inf, cost)
+            tw = (predicted_arr[:, 2] - predicted_arr[:, 0])
+            th = (predicted_arr[:, 3] - predicted_arr[:, 1])
+            # трек «за кадром»: центр предсказания вышел за границу более чем
+            # на размер собственного бокса — сопоставление с ним запрещено
+            out_x = (tcx[0] < -tw) | (tcx[0] > w_img + tw)
+            out_y = (tcy[0] < -th) | (tcy[0] > h_img + th)
+            offscreen = (out_x | out_y)[None, :]   # (1, n_trk) -> broadcast по dets
+            cost = np.where(offscreen, np.inf, cost)
+        return cost
 
     def update(self, dets: np.ndarray) -> list[tuple[int, np.ndarray, float, float]]:
         """Принимает Nx4 xyxy-массив лучших детекций мяча.
@@ -162,6 +196,14 @@ class SORTTracker:
         есть наблюдение в текущем кадре ИЛИ трек переживает короткую окклюзию
         (time_since_update <= max_age) — так траектория полёта остаётся
         непрерывной при пропусках детекции (подход BallTime™).
+
+        Физический gate (защита от срывов): если предсказанная позиция трека
+        уходит за пределы кадра или прыжок детекции к треку превышает
+        max_jump_frac * min(W,H) — сопоставление запрещена: такая пара либо
+        ложная детекция, либо «сорванный» трек. Трек без подтверждений быстро
+        умирает (max_age мал), и захват начнётся заново с чистой детекции.
+        Размеры кадра задаются через set_frame_size() (по умолчанию — без gate
+        по границам, обратная совместимость со старыми тестами).
         """
         self.frame_count += 1
 
@@ -178,22 +220,53 @@ class SORTTracker:
         predicted_arr = np.array(predicted) if predicted else np.empty((0, 4))
 
         if len(dets) and len(predicted_arr):
-            matches, u_det, u_trk = associate_detections_to_trackers(
-                dets, predicted_arr, self.iou_threshold)
-            for m in matches:
-                self.trackers[m[1]].update(dets[m[0]], self.frame_count)
-            for i in u_det:
-                self.trackers.append(KalmanBoxTracker(dets[i]))
+            cost = self._gate_cost(dets, predicted_arr)
+            finite = np.isfinite(cost)
+            matched_d: dict[int, int] = {}      # det_idx -> trk_idx
+            matched_t: dict[int, int] = {}      # trk_idx -> det_idx
+            cand_lists = []
+            for d in range(dets.shape[0]):
+                cand = np.where(finite[d])[0]
+                if len(cand):
+                    cand = cand[(-cost[d, cand]) >= self.iou_threshold]
+                cand_lists.append(cand)
+            # одна венгерская задача по всем допустимым парам (гарантирует
+            # взаимно-однозначное сопоставление: один трек <- одна детекция)
+            ncols = predicted_arr.shape[0]
+            big = float(np.nanmax(cost[np.isfinite(cost)])) + 1e6 \
+                if np.isfinite(cost).any() else 1e6
+            full = np.full((dets.shape[0], ncols), big)
+            for d, cand in enumerate(cand_lists):
+                if len(cand):
+                    full[d, cand] = cost[d, cand]
+            r_, c_ = linear_sum_assignment(full)
+            for di, ti in zip(r_, c_):
+                if full[di, ti] < big:
+                    matched_d[int(di)] = int(ti)
+                    matched_t[int(ti)] = int(di)
+            for di, ti in matched_d.items():
+                self.trackers[ti].update(dets[di], self.frame_count)
+            for i in range(dets.shape[0]):
+                if i not in matched_d:
+                    self.trackers.append(KalmanBoxTracker(dets[i]))
         elif len(dets):
             for d in dets:
                 self.trackers.append(KalmanBoxTracker(d))
 
-        # очистка старых
+        # очистка старых + физическая чистка «сорванных» треков за кадром
         out: list[tuple[int, np.ndarray, float, float]] = []
         alive: list[KalmanBoxTracker] = []
         for tr in self.trackers:
             if tr.time_since_update > self.max_age:
                 continue
+            if self.frame_size and tr.time_since_update > 0:
+                # трек живёт только на предсказаниях и ушёл далеко за кадр —
+                # это сорванный объект, немедленно снимаем его с наблюдения
+                cx, cy, w, h = tr._state_bbox()
+                W, H = self.frame_size
+                margin = max(w, h, 2.0 * settings.max_jump_frac * min(W, H))
+                if cx < -margin or cx > W + margin or cy < -margin or cy > H + margin:
+                    continue
             alive.append(tr)
             confirmed = (self.frame_count <= self.min_hits or tr.hits >= self.min_hits)
             if confirmed and tr.time_since_update <= self.max_age:

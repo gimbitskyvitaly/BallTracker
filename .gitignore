@@ -1,10 +1,6 @@
-# Python bytecode and caches
+# Compiled and build artifacts
 __pycache__/
 *.pyc
 
-# Model weights (large binary files)
-*.ptnode_modules/
-.next/
-dist/
-build/
-*.log
+# Media/Output files
+data/renders/

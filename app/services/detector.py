@@ -48,7 +48,12 @@ class BallDetector:
         self._lock = threading.Lock()
 
     def detect(self, frame: np.ndarray) -> tuple[list[Detection], list[Detection]]:
-        """Возвращает (мячи, игроки) для одного кадра BGR."""
+        """Возвращает (мячи, игроки) для одного кадра BGR.
+
+        Для мяча применяется отдельный, более строгий порог доверия
+        (settings.ball_conf_threshold): ложноположительные детекции «похожих
+        на мяч» объектов — главная причина срывов трекера.
+        """
         with self._lock:
             results = self._model.predict(
                 frame,
@@ -68,7 +73,8 @@ class BallDetector:
             cls = int(box.cls[0].cpu().numpy())
             det = Detection(bbox=xyxy, conf=conf, cls=cls)
             if cls == self.BALL_CLS:
-                balls.append(det)
+                if conf >= settings.ball_conf_threshold:
+                    balls.append(det)
             else:
                 persons.append(det)
         # мяч: берём наиболее вероятную детекцию первой

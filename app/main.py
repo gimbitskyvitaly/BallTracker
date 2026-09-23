@@ -19,13 +19,15 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.config import settings
 from app.services import storage
 from app.services.detector import BallDetector
 from app.services.pipeline import analyze_video
+from app.services.renderer import render_tracked_video
 
 app = FastAPI(title="BallTrack — pass trajectory & time-of-flight", version="1.0.0")
 
@@ -53,6 +55,30 @@ class JobOut(BaseModel):
     error: str | None
     created_at: str
     finished_at: str | None
+    has_result_video: bool = False
+
+
+def _job_out(j: dict) -> JobOut:
+    j = dict(j)
+    j["has_result_video"] = bool(j.pop("result_video_path", None))
+    return JobOut(**j)
+
+
+def _render_for_job(jid: str, path: str, force: bool = False) -> str:
+    """Видео с траекториями: кэш в БД или повторный анализ при необходимости."""
+    job = storage.get_job(jid)
+    if not job:
+        raise HTTPException(404, "job не найден")
+    cached = job.get("result_video_path")
+    if cached and os.path.exists(cached) and not force:
+        return cached
+    dst_dir = os.path.join(settings.render_dir, jid)
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, "tracked.mp4")
+    analysis = analyze_video(path, detector=get_detector())
+    render_tracked_video(path, dst, analysis)
+    storage.set_result_video(jid, dst)
+    return dst
 
 
 def _run_job(jid: str, path: str) -> None:
@@ -83,6 +109,16 @@ def _run_job(jid: str, path: str) -> None:
                           "initial_speed_mps": None, "peak_speed_mps": None})
             passes.append(d)
         storage.save_passes(jid, passes)
+        # сразу формируем видео с отрисованными траекториями поверх исходного
+        if settings.render_tracked_video:
+            try:
+                rdir = os.path.join(settings.render_dir, jid)
+                os.makedirs(rdir, exist_ok=True)
+                dst = os.path.join(rdir, "tracked.mp4")
+                render_tracked_video(path, dst, analysis)
+                storage.set_result_video(jid, dst)
+            except Exception:  # noqa: BLE001 — рендер не валит job
+                traceback.print_exc()
         storage.set_status(jid, "done", meta={
             "fps": analysis.fps, "width": analysis.width,
             "height": analysis.height, "n_frames": analysis.n_frames})
@@ -116,12 +152,12 @@ async def upload_video(file: UploadFile = File(...)):
     with storage._conn() as c:
         c.execute("UPDATE jobs SET video_path=? WHERE id=?", (path, jid))
     _executor.submit(_run_job, jid, path)
-    return JobOut(**storage.get_job(jid))
+    return _job_out(storage.get_job(jid))
 
 
 @app.get("/api/v1/jobs", response_model=list[JobOut])
 def jobs(limit: int = 50):
-    return [JobOut(**j) for j in storage.list_jobs(limit)]
+    return [_job_out(j) for j in storage.list_jobs(limit)]
 
 
 @app.get("/api/v1/jobs/{jid}", response_model=JobOut)
@@ -129,7 +165,7 @@ def job(jid: str):
     j = storage.get_job(jid)
     if not j:
         raise HTTPException(404, "job не найден")
-    return JobOut(**j)
+    return _job_out(j)
 
 
 @app.get("/api/v1/passes/{jid}")
@@ -137,6 +173,36 @@ def passes(jid: str):
     if not storage.get_job(jid):
         raise HTTPException(404, "job не найден")
     return storage.get_passes(jid)
+
+
+@app.get("/api/v1/jobs/{jid}/result-video")
+def result_video(jid: str, refresh: bool = Query(False, description="перерендерить заново")):
+    """Скачать видео, аналогичное загруженному, но с траекториями за мячом."""
+    job = storage.get_job(jid)
+    if not job:
+        raise HTTPException(404, "job не найден")
+    path = job.get("video_path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(409, "исходное видео недоступно")
+    if job["status"] == "error":
+        raise HTTPException(409, f"анализ завершился ошибкой: {job.get('error')}")
+    if job["status"] != "done" and not (job.get("result_video_path")
+                                        and os.path.exists(job["result_video_path"])):
+        raise HTTPException(409, "анализ ещё не завершён — дождитесь status=done")
+    dst = _render_for_job(jid, path, force=refresh)
+    return FileResponse(dst, media_type="video/mp4", filename=f"{jid}_tracked.mp4")
+
+
+@app.post("/api/v1/jobs/{jid}/render")
+def render_now(jid: str):
+    """Принудительно (пере)сформировать видео с траекториями и вернуть путь."""
+    job = storage.get_job(jid)
+    if not job:
+        raise HTTPException(404, "job не найден")
+    if job["status"] != "done":
+        raise HTTPException(409, "дождитесь status=done")
+    dst = _render_for_job(jid, job["video_path"], force=True)
+    return {"job_id": jid, "result_video_path": dst}
 
 
 @app.get("/api/v1/trajectories/{jid}")

@@ -42,6 +42,7 @@ class FlightEstimate:
     peak_speed_mps: float
     fit_rmse_px: float
     trajectory: list[dict] = field(default_factory=list)  # [{t, x_m, y_m}]
+    fit_params_px: list[float] | None = None  # [x0,y0,vx0,vy0,k] в px — для рендера
     method: str = "physics_fit"   # или "tracked_direct"
 
 
@@ -189,7 +190,8 @@ def estimate_flight(tracked_points: list[tuple[int, float, float]], fps: float,
             # физика уточняет моменты: релиз = t=0 модели, приёмка = конец наблюдений
             traj = [{"t": round(float(tt), 3),
                      "x_m": round(float(xx) * scale, 3),
-                     "y_m": round(float(yy) * scale, 3)}
+                     "y_m": round(float(yy) * scale, 3),
+                     "x_px": round(float(xx), 1), "y_px": round(float(yy), 1)}
                     for tt, xx, yy in zip(st, sx, sy)]
             apex_m = (sy.min() - ys[0]) * scale * -1  # y вниз => высота = -(y-y0)
             dist_m = math.hypot(sx[-1] - sx[0], sy[-1] - sy[0]) * scale
@@ -202,12 +204,15 @@ def estimate_flight(tracked_points: list[tuple[int, float, float]], fps: float,
                 peak_speed_mps=round(fit["peak_speed_px_s"] * scale, 2),
                 fit_rmse_px=round(fit["rmse_px"], 2),
                 trajectory=traj, method="physics_fit",
+                fit_params_px=[float(v) for v in fit["params"]],
             )
     if result is None:
         apex_px = ys.min()
+        # height_m: высота относительно релиза (вверх положительная)
         traj = [{"t": round(float((f - rel_f) / fps), 3),
                  "x_m": round(float(x) * scale, 3),
-                 "y_m": round(float((ys[0] - y)) * scale, 3)}
+                 "height_m": round(float(ys[0] - y) * scale, 3),
+                 "x_px": round(float(x), 1), "y_px": round(float(y), 1)}
                 for f, x, y in tracked_points]
         result = FlightEstimate(
             time_of_flight_s=round(tof_direct, 3),
