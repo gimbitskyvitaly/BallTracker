@@ -1,4 +1,9 @@
-node_modules/
+# Python bytecode and caches
+__pycache__/
+*.pyc
+
+# Model weights (large binary files)
+*.ptnode_modules/
 .next/
 dist/
 build/
