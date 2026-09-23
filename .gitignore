@@ -1,7 +1,6 @@
-# Compiled/Binary files
+# Python cache
 __pycache__/
 *.pyc
 
-# Environment
-.env
-.env.local
+# Media/Output artifacts (optional, depending on project policy, but usually large binaries are ignored)
+data/renders/

@@ -248,7 +248,10 @@ class SORTTracker:
             w_img, h_img = self.frame_size
             hard = settings.max_jump_frac * min(w_img, h_img)
             dist = np.hypot(dx, dy)
-            tsum = np.array([[tr.time_since_update] for tr in self.trackers], float)
+            # time_since_update по каждому треку: форма (1, n_trk), совпадает с
+            # осями cost/dx/dy (n_det, n_trk). Раньше строили (n_trk, 1) — это
+            # транслировалось в квадрат (n_trk, n_trk) и падало на (2,3)+(3,1).
+            tsum = np.array([[tr.time_since_update for tr in self.trackers]], float)
             ok = ok & (dist <= hard * np.maximum(tsum, 1.0))   # запас растёт с длиной окклюзии
             cost = np.where(ok, cost, np.inf)
             tw = (predicted_arr[:, 2] - predicted_arr[:, 0])
