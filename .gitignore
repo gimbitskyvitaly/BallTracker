@@ -1,6 +1,7 @@
-# Compiled and build artifacts
+# Compiled/Binary files
 __pycache__/
 *.pyc
 
-# Media/Output files
-data/renders/
+# Environment
+.env
+.env.local

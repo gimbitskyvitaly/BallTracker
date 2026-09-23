@@ -69,6 +69,9 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     tracker = SORTTracker()
     tracker.set_frame_size(width, height)   # физический gate от срывов за кадр
     set_gravity_px(fps, settings.gravity_ratio)
+    # Kalman-модель постоянного ускорения по вертикали: без этого члена
+    # предсказание систематически отстаёт на параболе и рвёт трек на быстром пасе
+    tracker.set_physics(settings.gravity_ratio)
 
     analysis = VideoAnalysis(fps=fps, width=width, height=height, n_frames=0)
 
