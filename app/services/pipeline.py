@@ -68,10 +68,14 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     det = detector or BallDetector()
     tracker = SORTTracker()
     tracker.set_frame_size(width, height)   # физический gate от срывов за кадр
-    set_gravity_px(fps, settings.gravity_ratio)
-    # Kalman-модель постоянного ускорения по вертикали: без этого члена
-    # предсказание систематически отстаёт на параболе и рвёт трек на быстром пасе
-    tracker.set_physics(settings.gravity_ratio)
+    set_gravity_px(fps, settings.gravity_ratio)   # только для fit'а метрик (px/s^2)
+    # Kalman-модель постоянного ускорения по вертикали: эмпирическое g в
+    # px/frame^2 (НЕ gravity_ratio*fps^2 — это размерность px/s^2 для фита;
+    # подстановка её в трекер разгоняла треки по вертикали — «catch на
+    # потолке», а при другом fps рвала полёт на осколки).
+    # Предел скорости трекера — из физического gate кадра.
+    v_max = settings.max_jump_frac * min(width, height)
+    tracker.set_physics(settings.kalman_gravity_px_f2, max_speed_px_per_f=v_max)
 
     analysis = VideoAnalysis(fps=fps, width=width, height=height, n_frames=0)
 

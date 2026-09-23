@@ -1,6 +1,1 @@
-# Python cache
 __pycache__/
-*.pyc
-
-# Media/Output artifacts (optional, depending on project policy, but usually large binaries are ignored)
-data/renders/

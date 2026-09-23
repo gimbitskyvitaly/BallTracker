@@ -30,6 +30,9 @@ class KalmanBoxTracker:
     # Без баллистического члена CV-модель систематически отстаёт на параболе,
     # и быстрый пас разрывал трек на осколки («мяч не детектится»).
     gravity_px_per_f2 = 0.0
+    # Максимальная физичная скорость мяча, px/frame (задаётся из pipeline через
+    # set_physics; 0 — без ограничения). Страховка от разгона треков-призраков.
+    max_speed_px_per_f = 0.0
 
     def __init__(self, bbox: np.ndarray):
         # состояние: [cx, cy, aspect, h, vx, vy, va, vh]
@@ -46,19 +49,24 @@ class KalmanBoxTracker:
         self.H = np.zeros((4, self.dim_w))
         self.H[:4, :4] = np.eye(4)
 
+        # --- Шумы: физичные, а не завышенные ---------------------------------
+        # Раньше std_vel = max(2h, 50) при h~20px давал P[vx]=2500, K[4,0]~0.75
+        # и фильтр на каждом шаге «съедал» почти всю оценку скорости: трек
+        # тормозил/соскакивал с реального мяча («детектор ползёт по экрану»,
+        # «траектория рисуется не там»). Теперь скорость стартует с нуля и
+        # набирается из наблюдений; шум — доля размера объекта.
         std_pos = max(h, 10.0)
-        std_vel = max(h * 2.0, 50.0)
+        std_vel = max(h * 0.5, 8.0)
         self.P = np.diag([std_pos**2, std_pos**2, 1.0, std_pos**2,
                           std_vel**2, std_vel**2, 1.0, std_vel**2])
 
         self.R = np.diag([max(h / 2, 2.0)**2] * 3 + [max(h / 2, 2.0)**2])
-        # Адаптивный шум процесса (поправка на «чрезмерную уверенность» Kalman):
-        # мяч — сильноускоряющийся объект (гравитация ~g/fps^2 px/frame^2),
-        # классический малый Q приводил к отставанию предсказания и разрыву
-        # трека на быстром пасе (баг «мяч не детектится»). Скоростная часть Q
-        # масштабируется с размером объекта; gravity_bias добавляется в predict.
+        # Шум процесса = ускорение между кадрами (баллистика), а не скорость:
+        # Q_vel ≈ (2*|g_px|)^2, но не ниже небольшой базы, чтобы трек мог
+        # набирать горизонтальную скорость с нуля (первый кадр после релиза).
+        acc_std = max(2.0 * abs(KalmanBoxTracker.gravity_px_per_f2), 3.0)
         self.Q = np.diag([std_pos**2 * 0.05, std_pos**2 * 0.05, 0.1, std_pos**2 * 0.05,
-                          std_vel**2 * 0.25, std_vel**2 * 0.25, 0.1, std_vel**2 * 0.25])
+                          acc_std**2, acc_std**2, 0.1, acc_std**2])
 
         self.id = KalmanBoxTracker.count
         KalmanBoxTracker.count += 1
@@ -79,7 +87,12 @@ class KalmanBoxTracker:
         self.x = self.F @ self.x
         g = KalmanBoxTracker.gravity_px_per_f2
         if g:
-            # баллистическая коррекция среднего: vy += g (y вниз положительно)
+            # баллистическая коррекция среднего: vy += g (y вниз положительно).
+            # ВАЖНО: гравитация в модели мяча — ЭМПИРИЧЕСКАЯ величина px/frame^2
+            # (зависит от масштаба сцены и фокального расстояния камеры), а не
+            # 9.8 м/с² напрямую; значение задаётся через set_physics() из
+            # pipeline (см. BT_GRAVITY_PX_F2). Завышенное g разгоняет трек по
+            # вертикали («catch на потолке»), занижённое — рвёт полёт на осколки.
             self.x[5] += g
         self.P = self.F @ self.P @ self.F.T + self.Q
         if g:
@@ -99,6 +112,16 @@ class KalmanBoxTracker:
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y
+        # Ограничение скорости: физичный максимум мяча ~ max_jump_frac*min(W,H)
+        # px/кадр (см. settings). Без клиппинга рассогласованный фильтр мог
+        # «разогнать» трек-призрак до сотен px/f — именно так ложный трек
+        # улетал по экрану и тянул за собой отрисованную траекторию.
+        vcap = KalmanBoxTracker.max_speed_px_per_f
+        vx, vy = self.x[4], self.x[5]
+        sp = math.hypot(vx, vy)
+        if vcap and sp > vcap:
+            s = vcap / sp
+            self.x[4], self.x[5] = vx * s, vy * s
         I_KH = np.eye(self.dim_w) - K @ self.H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
         self.hits += 1
@@ -186,9 +209,12 @@ def _mergeable_history(old_hist: list[np.ndarray], new_hist: list[np.ndarray],
 class SORTTracker:
     """Менеджер жизненного цикла треков (пороги — из Settings)."""
 
-    def set_physics(self, gravity_px_per_f2: float) -> None:
-        """Задаёт баллистическое ускорение для всех треков (Kalman CA-модель)."""
+    def set_physics(self, gravity_px_per_f2: float,
+                    max_speed_px_per_f: float = 0.0) -> None:
+        """Задаёт баллистическое ускорение (px/frame^2) и физичный предел
+        скорости (px/frame) для всех треков."""
         KalmanBoxTracker.gravity_px_per_f2 = gravity_px_per_f2
+        KalmanBoxTracker.max_speed_px_per_f = max_speed_px_per_f
 
     def __init__(self, max_age: int | None = None, min_hits: int | None = None,
                  iou_threshold: float | None = None):
