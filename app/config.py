@@ -44,6 +44,11 @@ class Settings:
     drag_coefficient: float = 0.02     # безразмерный коэффициент сопротивления воздуха
     use_physics_fit: bool = True       # подгонять баллистическую модель к трек-данным
 
+    # --- Отрисовка траекторий поверх видео -------------------------------------
+    render_tracked_video: bool = os.getenv("BT_RENDER_VIDEO", "1") == "1"
+    trail_length: int = int(os.getenv("BT_TRAIL_LENGTH", "25"))  # «хвост» за мячом, точек
+    render_dir: str = os.getenv("BT_RENDER_DIR", "data/renders")
+
     # --- Хранилище ------------------------------------------------------------
     db_path: str = os.getenv("BT_DB_PATH", "data/balltime.db")
     upload_dir: str = os.getenv("BT_UPLOAD_DIR", "data/uploads")

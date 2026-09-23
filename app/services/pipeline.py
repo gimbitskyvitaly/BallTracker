@@ -41,6 +41,7 @@ class VideoAnalysis:
     n_frames: int
     ball_track_points: list[dict] = field(default_factory=list)  # [{frame,x,y}]
     passes: list[PassEvent] = field(default_factory=list)
+    ball_radius_px: float = 6.0
 
 
 def _expanded(box: np.ndarray, scale: float) -> tuple[float, float, float, float]:
@@ -172,6 +173,8 @@ def analyze_video(path: str, detector: BallDetector | None = None,
         _finalize_pass(analysis, flight_pts, contact_person, None, fps,
                        ball_diam_sum / max(ball_diam_n, 1))
     cap.release()
+    if ball_diam_n:
+        analysis.ball_radius_px = max(4.0, ball_diam_sum / ball_diam_n / 2.0)
     return analysis
 
 

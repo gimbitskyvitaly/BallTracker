@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL DEFAULT 'pending',   -- pending|running|done|error
     fps REAL, width INTEGER, height INTEGER, n_frames INTEGER,
     error TEXT,
-    created_at TEXT, finished_at TEXT
+    created_at TEXT, finished_at TEXT,
+    result_video_path TEXT          -- видео с отрисованными траекториями
 );
 CREATE TABLE IF NOT EXISTS passes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +43,15 @@ def _conn() -> sqlite3.Connection:
 def init_db() -> None:
     with _conn() as c:
         c.executescript(SCHEMA)
+        # мягкая миграция для старых БД: добавляем недостающие колонки
+        cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)")}
+        if "result_video_path" not in cols:
+            c.execute("ALTER TABLE jobs ADD COLUMN result_video_path TEXT")
+
+
+def set_result_video(jid: str, path: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE jobs SET result_video_path=? WHERE id=?", (path, jid))
 
 
 def create_job(video_path: str) -> str:
