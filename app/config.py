@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
 
+
+load_dotenv()
 
 @dataclass
 class Settings:
@@ -22,7 +25,7 @@ class Settings:
     # но COCO-класс "sports ball" (id=32) из yolo11n работает из коробки.
     model_path: str = os.getenv("BT_MODEL_PATH", "app/yolo11n.pt")
     device: str = os.getenv("BT_DEVICE", "cpu")          # "cpu" / "0" (GPU)
-    conf_threshold: float = float(os.getenv("BT_CONF", "0.15"))
+    conf_threshold: float = float(os.getenv("BT_CONF"))
     class_ids: tuple[int, ...] = (32,)                    # COCO: 32 = sports ball
 
     # --- Трекинг (SORT / IoU-сопоставление) ---------------------------------
