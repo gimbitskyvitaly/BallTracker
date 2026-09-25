@@ -1,18 +1,34 @@
-"""Пайплайн анализа видео: YOLO-детекция → SORT-трекинг → события паса → физика.
+"""Пайплайн анализа видео: детекция → SORT-трекинг мяча + игроков → события.
 
-Логика детекции паса (по аналогии с BallTime™, где события привязываются
-к игрокам):
+Архитектура (по аналогии с BallTime™ / готовыми sports-analytics-решениями,
+где события привязываются к игрокам, а не только к геометрии мяча):
+
+  * Игроки ведутся отдельным SORT-трекером (person tracker): стабильный
+    track id игрока — основа для «пас от одного игрока другому». Раньше
+    игроки матчились по «квантованному bbox» (_person_key), что ломалось
+    при дрожании/перемещении боксов;
   * CONTACT: центр мяча попал в зону вокруг бокса игрока (бокс наружу на
     contact_expand * диагональ); владение засчитывается после contact_streak
     подряд кадров контакта — «мяч отлетает от игрока»;
-  * RELEASE: был подтверждённый контакт (владение) и мяч покинул зону игрока
-    (не позже release_max_lag кадров после последнего касания);
-  * CATCH: траектория входит в расширенный бокс ДРУГОГО игрока;
+  * RELEASE: был ПОДТВЕРЖДЁННЫЙ контакт (владение) и мяч покинул зону
+    игрока (не позже release_max_lag кадров после последнего касания).
+    Мягкие «полёты ниоткуда» (без владения) НЕ порождают сегментов: на
+    реальных видео они обрывали настоящий пас на первых кадрах и давали
+    слишком короткие сегменты, которые классификатор отвергал, — итог:
+    «пас вообще не детектится» (баг). Порог BT_REQUIRE_CONTACT=0 оставляет
+    мягкий режим как аварийный fallback;
+  * CATCH: траектория входит в расширенный бокс ДРУГОГО игрока (другой
+    person-track);
   * между release и catch формируется сегмент полёта, который затем
-    КЛАССИФИЦИРУЕТСЯ: пасом считается только выраженная передача между
-    игроками (см. _is_pass). Подача (вертикальный удар без смены игрока),
-    приём (медленный контакт), атака (монотонное падение вниз / удар тому же
-    игроку) — пасами НЕ считаются. Это исправляет баг «4 паса за розыгрыш».
+    КЛАССИФИЦИРУЕТСЯ (_is_pass): пас = мяч отлетел от игрока и пролетёл
+    выражено по параболе влево/вправо к другому игроку. Подача
+    (вертикальный удар), приём (медленный контакт), атака (монотонное
+    падение / возврат тому же игроку) — пасами НЕ считаются (баг
+    «4 паса за розыгрыш»).
+  * Траектория мяча пишется в ball_track_points ВСЕГДА, когда мяч виден
+    (а не только внутри признанных полётов): иначе при строгой
+    классификации на видео не остаётся ни одной отметки (баг «нет
+    траекторий»), а API/render теряют данные для показа.
 """
 
 from __future__ import annotations
@@ -36,6 +52,8 @@ class PassEvent:
     passer_bbox: list[float]
     catcher_bbox: list[float] | None
     flight: FlightEstimate | None = None
+    passer_id: int | None = None
+    catcher_id: int | None = None
 
 
 @dataclass
@@ -59,14 +77,6 @@ def _expanded(box: np.ndarray, scale: float) -> tuple[float, float, float, float
 
 def _inside(pt: tuple[float, float], rect) -> bool:
     return rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]
-
-
-def _person_key(p: Detection) -> tuple:
-    """Стабильный ключ игрока для сопоставления «тот же / другой»:
-    координаты бокса, округлённые до 8 px (bbox'ы YOLO дрожат на единицы
-    пикселей; реальные перемещения игроков между контактами больше порога)."""
-    x1, y1, x2, y2 = p.bbox
-    return (round(x1 / 8), round(y1 / 8), round(x2 / 8), round(y2 / 8))
 
 
 def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
@@ -150,7 +160,14 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     det = detector or BallDetector()
     tracker = SORTTracker()
+    # Отдельный SORT-трекер игроков: даёт СТАБИЛЬНЫЕ track id людей, по ним
+    # определяем «тот же игрок / другой игрок» (passer != catcher). Раньше
+    # игроки матчились по квантованному bbox — на реальных видео (дрожание,
+    # перемещение, частичные окклюзии) идентификаторы прыгали и владение
+    # не подтверждалось никогда — «пас вообще не детектится».
+    ptracker = SORTTracker(max_age=settings.person_max_age, min_hits=1)
     tracker.set_frame_size(width, height)   # физический gate от срывов за кадр
+    ptracker.set_frame_size(width, height)
     set_gravity_px(fps, settings.gravity_ratio)   # только для fit'а метрик (px/s^2)
     # Kalman-модель постоянного ускорения по вертикали: эмпирическое g в
     # px/frame^2 (НЕ gravity_ratio*fps^2 — это размерность px/s^2 для фита;
@@ -164,6 +181,7 @@ def analyze_video(path: str, detector: BallDetector | None = None,
 
     prev_ball: tuple[float, float] | None = None
     contact_person: Detection | None = None      # игрок, державший мяч
+    contact_pid: int | None = None               # track id владеющего игрока
     last_contact_frame: int = 0                  # последний кадр подтверждения владения
     flight_pts: list[tuple[int, float, float]] = []
     ball_diam_sum, ball_diam_n = 0.0, 0
@@ -181,6 +199,10 @@ def analyze_video(path: str, detector: BallDetector | None = None,
         ball_det: Detection | None = balls[0] if balls else None
         dets_arr = np.array([b.bbox for b in balls[:3]]) if balls else np.empty((0, 4))
         tracks = tracker.update(dets_arr)
+        # --- трекинг игроков: [{track_id: (bbox, center)}] -------------------
+        pdets_arr = np.array([p.bbox for p in persons]) if persons else np.empty((0, 4))
+        ptracks = ptracker.update(pdets_arr)
+        person_tracks = {int(t[0]): t[1] for t in ptracks}
         tvx = tvy = 0.0
         center: tuple[float, float] | None = None
         used_det: Detection | None = None
@@ -227,16 +249,21 @@ def analyze_video(path: str, detector: BallDetector | None = None,
         else:
             prev_ball = None
 
-        # --- состояние контакта с игроком -----------------------------------
+        # --- состояние контакта с игроком ------------------------------------
+        # ближайший игрок считаем по СВЕЖИМ трекам (детекция или Kalman-
+        # предсказание трекера игроков): детекции YOLO/CV нестабильны покадрово
         nearest_person = None
-        if center and persons:
-            best_p, bestd = None, 1e18
-            for p in persons:
-                pcx, pcy = p.center
+        nearest_pid = None
+        if center and person_tracks:
+            best_p, bestd, best_id = None, 1e18, None
+            for pid, tb in person_tracks.items():
+                pcx, pcy = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
                 d = math.hypot(center[0] - pcx, center[1] - pcy)
                 if d < bestd:
-                    best_p, bestd = p, d
-            nearest_person = best_p
+                    best_p, bestd, best_id = np.asarray(tb, float), d, pid
+            if best_p is not None:
+                nearest_person = Detection(best_p, 0.9, 0)
+                nearest_pid = best_id
 
         if center and nearest_person is not None:
             rect = _expanded(nearest_person.bbox, settings.contact_expand)
@@ -253,14 +280,15 @@ def analyze_video(path: str, detector: BallDetector | None = None,
         has_contact = contact_streak >= settings.contact_streak
 
         # эпизод без людей вообще (повтор/тайм-аут/пустой кадр) — сброс состояния
-        if not persons:
+        if not persons and not person_tracks:
             no_person_frames += 1
             if no_person_frames >= settings.no_person_reset:
                 contact_person = None
+                contact_pid = None
                 contact_streak = 0
                 if flight_pts:
                     _finalize_segment(analysis, flight_pts, contact_person, None,
-                                      fps, width, height)
+                                      contact_pid, None, fps, width, height)
                     flight_pts = []
         else:
             no_person_frames = 0
@@ -270,39 +298,45 @@ def analyze_video(path: str, detector: BallDetector | None = None,
                 # приёмка: полёт завершён (пас или другое событие — решит
                 # классификатор _is_pass)
                 _finalize_segment(analysis, flight_pts, contact_person,
-                                  nearest_person, fps, width, height)
+                                  nearest_person, contact_pid, nearest_pid,
+                                  fps, width, height)
                 flight_pts = []
             # фиксируем владение: новый контакт всегда принадлежит текущему
             # ближайшему игроку (если серия идёт у того же — ничего не меняется)
             contact_person = nearest_person
+            contact_pid = nearest_pid
             last_contact_frame = frame_id
         elif center is not None:
             if not flight_pts:
-                # Релиз. Если владение подтверждено (свежий контакт с игроком) —
-                # сегмент начинаем всегда. Если нет — только при отключённом
-                # строгом требовании BT_REQUIRE_CONTACT и ТОЛЬКО когда в кадре
-                # есть люди: без person-детекций пас неоткуда брать, а мяч,
-                # летящий «в пустом» кадре, — почти всегда артефакт трека.
+                # Релиз начинается ТОЛЬКО после подтверждённого владения
+                # (строгий режим по умолчанию). Мягкий режим
+                # (BT_REQUIRE_CONTACT=0) допускает «полёт ниоткуда», если в
+                # кадре есть люди, — аварийный fallback для видео, где
+                # контактная зона не настраивается.
                 fresh = contact_person is not None \
                     and (frame_id - last_contact_frame) <= settings.release_max_lag
-                if fresh or (not settings.require_release_contact and persons):
+                soft = (not settings.require_release_contact) and persons
+                if fresh or soft:
                     flight_pts.append((frame_id, center[0], center[1]))
             else:
                 flight_pts.append((frame_id, center[0], center[1]))
             # защита от «вечного» полёта без приёмки
             if flight_pts and frame_id - flight_pts[-1][0] > settings.max_age:
                 _finalize_segment(analysis, flight_pts, contact_person, None,
-                                  fps, width, height)
+                                  contact_pid, None, fps, width, height)
                 flight_pts = []
                 contact_person = None
+                contact_pid = None
 
         if used_det is not None:
             diag = used_det.diag
             ball_diam_sum += min(diag, height * 0.5)
             ball_diam_n += 1
-        if center is not None and flight_pts:
-            # В ball_track_points пишем ТОЛЬКО точки активного полёта (пасов):
-            # вне полёта мяч не отслеживаем ни в анализе, ни в рендере.
+        if center is not None:
+            # Траектория пишется ВСЕГДА, когда мяч виден: и во время полёта,
+            # и при владении (маркер мяча на видео обязателен — баг «никаких
+            # отметок на видео нет»). Полупрозрачная отрисовка вне полётов
+            # делается в renderer по признаку «точка внутри окна паса».
             analysis.ball_track_points.append(
                 {"frame": frame_id, "x": round(center[0], 1), "y": round(center[1], 1)})
         if progress_cb and frame_id % 25 == 0:
@@ -313,7 +347,7 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     # незавершённый полёт в конце видео
     if flight_pts:
         _finalize_segment(analysis, flight_pts, contact_person, None,
-                          fps, width, height)
+                          contact_pid, None, fps, width, height)
     cap.release()
     if ball_diam_n:
         analysis.ball_radius_px = max(4.0, ball_diam_sum / ball_diam_n / 2.0)
@@ -322,8 +356,8 @@ def analyze_video(path: str, detector: BallDetector | None = None,
 
 
 def _finalize_segment(analysis: VideoAnalysis, pts, passer: Detection | None,
-                      catcher: Detection | None, fps: float,
-                      width: int, height: int) -> None:
+                      catcher: Detection | None, passer_id, catcher_id,
+                      fps: float, width: int, height: int) -> None:
     """Завершение сегмента полёта: классификация (пас / подача / приём /
     атака) и, если это пас — оценка физики и регистрация события."""
     try:
@@ -332,7 +366,7 @@ def _finalize_segment(analysis: VideoAnalysis, pts, passer: Detection | None,
     except Exception:  # noqa: BLE001 — классификатор не должен валить анализ
         return
     _finalize_pass(analysis, pts, passer, catcher, fps,
-                   ball_diam_sum_px(analysis))
+                   ball_diam_sum_px(analysis), passer_id, catcher_id)
 
 
 def ball_diam_sum_px(analysis: VideoAnalysis) -> float:
@@ -341,7 +375,7 @@ def ball_diam_sum_px(analysis: VideoAnalysis) -> float:
 
 def _finalize_pass(analysis: VideoAnalysis, pts, passer: Detection | None,
                    catcher: Detection | None, fps: float,
-                   ball_diam_px: float) -> None:
+                   ball_diam_px: float, passer_id=None, catcher_id=None) -> None:
     if len(pts) < settings.min_flight_frames:
         return
     flight = estimate_flight(pts, fps, ball_diam_px,
@@ -353,5 +387,7 @@ def _finalize_pass(analysis: VideoAnalysis, pts, passer: Detection | None,
         passer_bbox=passer.bbox.tolist() if passer else [0, 0, 0, 0],
         catcher_bbox=catcher.bbox.tolist() if catcher else None,
         flight=flight,
+        passer_id=passer_id,
+        catcher_id=catcher_id,
     )
     analysis.passes.append(ev)
