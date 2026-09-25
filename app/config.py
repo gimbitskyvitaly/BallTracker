@@ -21,19 +21,24 @@ load_dotenv()
 @dataclass
 class Settings:
     # --- Модель детекции ----------------------------------------------------
-    # sports-specific веса (TrackNet-подобные) дают лучшее качество на мяче,
-    # но COCO-класс "sports ball" (id=32) из yolo11n работает из коробки.
-    model_path: str = os.getenv("BT_MODEL_PATH", "app/yolo11n.pt")
+    # ВАЖНО: базовая yolo11n (nano, COCO) почти НЕ детектит маленький/размытый
+    # мяч на реальных спортивных видео (conf < 0.1 → flights=[]). По умолчанию
+    # используется yolo11m (medium): ~4x точнее на мелких объектах, COCO-класс
+    # 32 "sports ball" работает из коробки. Для продакшена ещё лучше:
+    #   - fine-tuned YOLO на Roboflow sports-датасетах (soccer/tennis/volleyball);
+    #   - TrackNetv2/3 (сегментационный детектор мяча, SOTA для тенниса/бадминтона);
+    #   путь к своим весам — env BT_MODEL_PATH (см. detector.py: поддержка .pt/.onnx).
+    model_path: str = os.getenv("BT_MODEL_PATH", "app/yolo11m.pt")
+    # Fallback: если основная модель недоступна (файл удалён/не скачан) —
+    # пробуем nano; обе модели используют те же классы COCO.
+    model_fallback_path: str = os.getenv("BT_MODEL_FALLBACK_PATH", "app/yolo11n.pt")
     device: str = os.getenv("BT_DEVICE", "cpu")          # "cpu" / "0" (GPU)
     conf_threshold: float = float(os.getenv("BT_CONF", "0.15"))
-    # Порог доверия для мяча ВЫШЕ общего: COCO-детектор порождает много
-    # ложных срабатываний ("мяч" из текстур поля/теней) при низком conf —
-    # именно они срывали трекер на неестественные траектории.
-    # 0.30 отброшено: детектор в E2E-тестах/API отдаёт conf~0.25, а реальный
-    # мяч на видео часто детектируется с conf 0.15-0.3 — порог «в одну сторону»
-    # глушил всю детекцию (симптом: flights=[]). Ложные срабатывания теперь
-    # отсекаются адаптивным физическим gate трекера, а не высоким порогом.
-    ball_conf_threshold: float = float(os.getenv("BT_BALL_CONF", "0.18"))
+    # Порог доверия для мяча: yolo11m даёт на реальном мяче уверенно 0.3+,
+    # поэтому порог поднят с 0.18 до 0.25 — это отсекает текстуры поля/тени,
+    # которые срывали трекер на «неестественные траектории». На мелком/быстром
+    # мяче можно опустить через BT_BALL_CONF=0.20.
+    ball_conf_threshold: float = float(os.getenv("BT_BALL_CONF", "0.25"))
     class_ids: tuple[int, ...] = (32,)                    # COCO: 32 = sports ball
 
     # --- Трекинг (SORT / IoU-сопоставление) ---------------------------------

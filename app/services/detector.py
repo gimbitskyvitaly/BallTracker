@@ -1,28 +1,43 @@
-"""Детекция мяча и игроков на кадрах видео с помощью YOLO (ultralytics).
+"""Детекция мяча и игроков на кадрах видео.
 
-Используется предобученная модель yolo11n (COCO): класс 32 — "sports ball",
-класс 0 — "person". Для продакшена рекомендуется fine-tuned sports-веса
-(TrackNet / кастомный датасет) — путь задаётся через BT_MODEL_PATH.
+Почему НЕ чистый COCO-YOLO: базовые веса yolo11n/yolo11m (COCO, класс 32
+"sports ball") практически не детектируют маленький/быстрый/размытый мяч на
+реальных спортивных видео — conf падает ниже любого порога, flights=[].
+Это подтверждено замерами: детекторы COCO обучаются на статичных фото, а не
+на теле-трансляциях. Поэтому конвейер использует ДВА каскада:
+
+1) Основной — OpenCV CSRT/MOSSE визуальный трекер + цветовой (HSV) поиск
+   кандидата в зоне ожидаемого полёта. Работает на любом спорте без обучения,
+   именно так исторически решался трекинг мяча до эпохи глубокого обучения;
+   устойчив к низким conf нейросетевого детектора.
+2) Уточняющий — YOLO (.pt/.onnx): предобученные sports-веса или fine-tuned
+   модель (BT_MODEL_PATH). Детекции используются для переинициализации
+   визуального трекера и фильтрации ложных цветовых срабатываний.
+
+Если у кастомной модели свои id классов — BT_BALL_CLS / BT_PERSON_CLS
+(Roboflow soccer-датасеты часто имеют ball=0; для ONNX без имён это обязательно!).
 """
 
 from __future__ import annotations
 
+import os
 import threading
-from dataclasses import dataclass
 
+import cv2
 import numpy as np
-from ultralytics import YOLO
 
 from app.config import settings
 
 
-@dataclass
 class Detection:
     """Одна детекция: [x1, y1, x2, y2], confidence, class_id."""
 
-    bbox: np.ndarray
-    conf: float
-    cls: int
+    __slots__ = ("bbox", "conf", "cls")
+
+    def __init__(self, bbox: np.ndarray, conf: float, cls: int):
+        self.bbox = np.asarray(bbox, dtype=float)
+        self.conf = float(conf)
+        self.cls = int(cls)
 
     @property
     def center(self) -> tuple[float, float]:
@@ -36,48 +51,236 @@ class Detection:
         return float(np.hypot(w, h))
 
 
-class BallDetector:
-    """Потокобезопасная обёртка над YOLO для покадровой детекции."""
+def _make_visual_tracker():
+    """Создание визуального трекера с перебором API всех версий OpenCV.
 
-    BALL_CLS = 32
-    PERSON_CLS = 0
+    Приоритет: CSRT (точней) -> MIL (есть во всех сборках, в т.ч. opencv-python
+    4.10+/5.x headless) -> KCF (быстрый fallback). Возвращает объект с методами
+    init(frame,(x,y,w,h)) / update(frame)->(ok,(x,y,w,h)).
+    """
+    for maker in (
+        lambda: cv2.TrackerCSRT_create(),
+        lambda: cv2.tracking.TrackerCSRT.create(),
+        lambda: cv2.legacy.TrackerCSRT_create(),
+        lambda: cv2.TrackerMIL_create(),
+        lambda: cv2.tracking.TrackerMIL.create(),
+        lambda: cv2.legacy.TrackerMIL_create(),
+        lambda: cv2.TrackerKCF_create(),
+        lambda: cv2.legacy.TrackerKCF_create(),
+    ):
+        try:
+            tr = maker()
+            if tr is not None:
+                return tr
+        except Exception:
+            continue
+    raise RuntimeError("OpenCV build has no available tracker API")
+
+
+class BallDetector:
+    """Потокобезопасный детектор мяча: CV-трекер (CSRT) + HSV-поиск + YOLO-каскад."""
+
+    BALL_CLS = int(os.getenv("BT_BALL_CLS", "32"))
+    PERSON_CLS = int(os.getenv("BT_PERSON_CLS", "0"))
 
     def __init__(self, model_path: str | None = None, device: str | None = None):
-        self._model = YOLO(model_path or settings.model_path)
         self._device = device or settings.device
         self._lock = threading.Lock()
+        self.model_path = ""
+        self._model = None          # ленивая загрузка YOLO
+        self._requested_model = model_path or settings.model_path
+        # состояние визуального трекинга мяча
+        self._tracker = None
+        self._tracker_bbox = None   # (x, y, w, h)
+        self._lost_frames = 0
+        self._ball_hsv_ranges = []  # выученная палитра мяча [(lo, hi), ...]
 
-    def detect(self, frame: np.ndarray) -> tuple[list[Detection], list[Detection]]:
-        """Возвращает (мячи, игроки) для одного кадра BGR.
+    # ------------------------------------------------------------------ YOLO
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._model
+        path = self._requested_model
+        if not os.path.exists(path):
+            fb = settings.model_fallback_path
+            if fb and os.path.exists(fb):
+                path = fb
+            else:
+                path = os.path.basename(path)  # ultralytics скачает сам
+        try:
+            from ultralytics import YOLO
+            self._model = YOLO(path)
+            self.model_path = path
+        except Exception:
+            self._model = False     # YOLO недоступен — работаем на CV-каскаде
+        return self._model
 
-        Для мяча применяется отдельный, более строгий порог доверия
-        (settings.ball_conf_threshold): ложноположительные детекции «похожих
-        на мяч» объектов — главная причина срывов трекера.
-        """
+    def _yolo_detect(self, frame: np.ndarray):
+        m = self._ensure_model()
+        if not m:
+            return [], []
         with self._lock:
-            results = self._model.predict(
+            results = m.predict(
                 frame,
                 conf=settings.conf_threshold,
                 classes=[self.BALL_CLS, self.PERSON_CLS],
                 device=self._device,
                 verbose=False,
             )
-        balls: list[Detection] = []
-        persons: list[Detection] = []
+        balls, persons = [], []
         r = results[0]
         if r.boxes is None:
             return balls, persons
         for box in r.boxes:
-            xyxy = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0].cpu().numpy())
-            cls = int(box.cls[0].cpu().numpy())
-            det = Detection(bbox=xyxy, conf=conf, cls=cls)
-            if cls == self.BALL_CLS:
-                if conf >= settings.ball_conf_threshold:
-                    balls.append(det)
+            det = Detection(
+                bbox=box.xyxy[0].cpu().numpy(),
+                conf=float(box.conf[0].cpu().numpy()),
+                cls=int(box.cls[0].cpu().numpy()),
+            )
+            if det.cls == self.BALL_CLS:
+                balls.append(det)
             else:
                 persons.append(det)
-        # мяч: берём наиболее вероятную детекцию первой
         balls.sort(key=lambda d: -d.conf)
         persons.sort(key=lambda d: -d.conf)
         return balls, persons
+
+    # ------------------------------------------------------------- HSV search
+    def _hsv_candidates(self, frame, roi=None, min_area=6.0, max_area_frac=0.01):
+        """Кандидаты «похожие на мяч» по выученной HSV-палитре (или яркие круги)."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        ranges = self._ball_hsv_ranges or [
+            ((0, 0, 170), (180, 70, 255)),      # белый/светлый мяч
+            ((15, 120, 120), (40, 255, 255)),   # оранжевый/жёлтый мяч
+        ]
+        mask = np.zeros(hsv.shape[:2], np.uint8)
+        for lo, hi in ranges:
+            mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+        if roi is not None:
+            x1, y1, x2, y2 = roi
+            keep = np.zeros_like(mask)
+            H, W = mask.shape
+            keep[max(0, y1):max(0, y2), max(0, x1):max(0, x2)] = 255
+            mask &= (keep > 0)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        max_area = frame.shape[0] * frame.shape[1] * max_area_frac
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < min_area or a > max_area:
+                continue
+            (cx, cy), rad = cv2.minEnclosingCircle(c)
+            circ = a / (np.pi * rad * rad + 1e-6)          # ~1 для круга
+            if circ < 0.55:
+                continue
+            d = 2 * rad
+            out.append(Detection(
+                bbox=np.array([cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2]),
+                conf=float(min(0.99, 0.4 + 0.5 * circ)),
+                cls=self.BALL_CLS,
+            ))
+        out.sort(key=lambda dd: -dd.conf)
+        return out
+
+    def _learn_palette(self, frame, bbox_xyxy):
+        """Выучить HSV-палитру мяча по первому надёжному боксу (YOLO/вручную)."""
+        x1, y1, x2, y2 = map(int, bbox_xyxy)
+        H, W = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+        if x2 <= x1 or y2 <= y1:
+            return
+        patch = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+        h = patch[..., 0].ravel().astype(np.int16)
+        s = patch[..., 1].ravel()
+        v = patch[..., 2].ravel()
+        # разрыв вокруг красной границы hue (0/180) обрабатываем циклически
+        hmin, hmax = int(np.percentile(h, 10)), int(np.percentile(h, 90))
+        if hmax - hmin > 90:  # красный мяч: диапазон через 180→0
+            self._ball_hsv_ranges = [
+                ((max(0, hmin - 8), 40, 60), (180, 255, 255)),
+                ((0, 40, 60), (min(179, hmax - 180 + 8), 255, 255)),
+            ]
+        else:
+            self._ball_hsv_ranges = [
+                ((max(0, hmin - 8), max(0, int(np.percentile(s, 20)) - 30), 60),
+                 (min(179, hmax + 8), 255, 255))
+            ]
+
+    # ---------------------------------------------------------------- public
+    def detect(self, frame: np.ndarray) -> tuple[list[Detection], list[Detection]]:
+        """Возвращает (мячи, игроки) для одного кадра BGR.
+
+        Мяч: сначала сопровождение CSRT-трекером; при его потере — HSV-поиск
+        в окрестности предсказанной позиции; YOLO-детекции (если есть) служат
+        триггером переинициализации и калибровки палитры. Игроки — из YOLO
+        (при недоступности модели возвращаются пустым списком; события
+        release/catch тогда выводятся по геометрии траектории в pipeline).
+        """
+        self._last_frame = frame
+        yolo_balls, persons = self._yolo_detect(frame)
+        strong_yolo = [d for d in yolo_balls if d.conf >= settings.ball_conf_threshold]
+        H, W = frame.shape[:2]
+
+        # 1) пробуем вести существующий трекер
+        if self._tracker is not None and self._tracker_bbox is not None:
+            ok, bb = self._tracker.update(frame)
+            if ok:
+                x, y, w, h = [float(t) for t in bb]
+                if w > 2 and h > 2 and w * h < 0.05 * W * H:
+                    self._tracker_bbox = (x, y, w, h)
+                    self._lost_frames = 0
+                    det = Detection(np.array([x, y, x + w, y + h]), conf=0.9, cls=self.BALL_CLS)
+                    # редкая сверка с YOLO: если тот уверенно видит мяч далеко
+                    # от трекера — верим ему (переинициализация)
+                    if strong_yolo:
+                        dx = abs(strong_yolo[0].center[0] - det.center[0])
+                        dy = abs(strong_yolo[0].center[1] - det.center[1])
+                        if max(dx, dy) > 3 * max(w, h):
+                            self._reinit_tracker(strong_yolo[0].bbox)
+                            self._learn_palette(frame, strong_yolo[0].bbox)
+                            return strong_yolo[:1], persons
+                    return [det], persons
+                ok = False
+            self._lost_frames += 1
+            if self._lost_frames > settings.max_age * 2:
+                self._tracker = None
+                self._tracker_bbox = None
+
+        # 2) candidate: HSV-поиск в ROI вокруг последней позиции
+        #    (или глобально, если трека ещё нет)
+        roi = None
+        if self._tracker_bbox is not None:
+            x, y, w, h = self._tracker_bbox
+            pad = max(4 * w, 4 * h, 60) + 12 * self._lost_frames
+            roi = (int(x - pad), int(y - pad), int(x + w + pad), int(y + h + pad))
+        cands = self._hsv_candidates(frame, roi=roi)
+        if not cands and strong_yolo:
+            cands = strong_yolo[:1]
+        if cands:
+            best = cands[0]
+            self._reinit_tracker(best.bbox)
+            # Самокалибровка палитры под цвет мяча: по первому надёжному
+            # боксу (уверенный YOLO или первый найденный круглый кандидат).
+            if not self._ball_hsv_ranges:
+                if best.conf >= 0.4:
+                    self._learn_palette(frame, best.bbox)
+            return [best], persons
+
+        # 3) ничего не ведём: отдаём то, что видит YOLO (порог конф. применён)
+        return strong_yolo, persons
+
+    def _reinit_tracker(self, bbox_xyxy):
+        x1, y1, x2, y2 = bbox_xyxy
+        bb = (x1, y1, max(2.0, x2 - x1), max(2.0, y2 - y1))
+        self._tracker = _make_visual_tracker()
+        if hasattr(self, "_last_frame") and self._last_frame is not None:
+            self._tracker.init(self._last_frame, tuple(int(v) for v in bb))
+        self._tracker_bbox = bb
+        self._lost_frames = 0
+
+    def detect_batch_init(self, frame, bbox_xyxy):
+        """Явная инициализация трека (для тестов/ручной разметки стартового бокса)."""
+        self._last_frame = frame.copy()
+        self._reinit_tracker(bbox_xyxy)
+        self._learn_palette(frame, bbox_xyxy)
