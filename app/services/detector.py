@@ -144,6 +144,77 @@ class BallDetector:
         persons.sort(key=lambda d: -d.conf)
         return balls, persons
 
+    # ------------------------------------------------------- CV fallback: players
+    def _cv_persons(self, frame: np.ndarray) -> list[Detection]:
+        """Детекция «игроков» без нейросети (fallback-каскад).
+
+        Когда YOLO недоступен/ничего не нашёл, игроками считаются крупные
+        связные области, отличающиеся от фона: сегментация по цвету
+        (квантованный HSV + connected components) с двумя фильтрами:
+          * высота бокса >= person_min_h_frac * H (игроки в кадре — 30-70%
+            высоты; отсекает скамейки, щиты, мяч, тени);
+          * область НЕ похожа на круг (fill < circle_max_fill) — иначе
+            яркий мяч сам становился «игроком», раздувал зону контакта и
+            система никогда не фиксировала «отлёт от игрока» (пас не
+            детектировался).
+        Это нужно для ветки contact/release: без person-детекций владение
+        принципиально невозможно подтвердить и пасы теряются на реальных
+        видео, где COCO-модель не запускается (CPU-only сборка, кастомные
+        веса). Пороги — env BT_MIN_PERSON_H_FRAC / BT_CV_PERSON_MAX_CIRC.
+        """
+        H, W = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # Квантование цвета: 3 бита на канал (8 уровней) — устойчиво к JPEG/
+        # mp4-шуму вокруг краёв объектов. connectedComponents принимает
+        # только 8U/8S, поэтому упаковываем (h,s,v) в uint8 и делаем
+        # compact-remap меток (0 резервируется под «самый частый» цвет —
+        # фон кадра).
+        qh = hsv[..., 0] >> 5                            # 0..7
+        qs = hsv[..., 1] >> 5
+        qv = hsv[..., 2] >> 5
+        lab = (qh.astype(np.int32) << 6) | (qs.astype(np.int32) << 3) | qv.astype(np.int32)
+        vals, counts = np.unique(lab, return_counts=True)
+        bg_val = int(vals[int(np.argmax(counts))])       # доминирующий цвет = фон
+        keep = vals != bg_val
+        codes = np.zeros(len(vals), np.uint8)
+        codes[keep] = np.arange(1, int(keep.sum()) + 1, dtype=np.uint8)
+        remap = np.zeros(int(vals.max()) + 1, np.uint8)
+        remap[vals] = codes
+        lab8 = remap[lab]                                # фон -> 0
+        n_lab, labels, stats, _ = cv2.connectedComponentsWithStats(
+            lab8, connectivity=4)
+        min_h = settings.person_min_h_frac * H
+        max_w = 0.6 * W
+        out: list[Detection] = []
+        for i in range(1, n_lab):                      # 0 — метка «фона» не бывает:
+            x, y, w, h, area = stats[i]                # connectedComponents по всей картинке
+            if h < min_h or area < 0.001 * W * H or w > max_w or w < 0.2 * h:
+                continue
+            m = (labels == i)
+            ys_, xs_ = np.nonzero(m)
+            x1, y1, x2, y2 = xs_.min(), ys_.min(), xs_.max(), ys_.max()
+            bw, bh = x2 - x1 + 1, y2 - y1 + 1
+            fill = area / float(bw * bh)
+            # круглый компактный blob (мяч) — не игрок
+            if fill > settings.cv_person_max_circle_fill and \
+                    0.7 <= bw / max(bh, 1) <= 1.4:
+                continue
+            conf = float(min(0.9, 0.35 + 3.0 * area / float(W * H)))
+            out.append(Detection(np.array([x1, y1, x2 + 1, y2 + 1], float),
+                                 conf, self.PERSON_CLS))
+        # боксы, полностью лежащие внутри более крупного — дубли: оставляем внешние
+        out.sort(key=lambda d: -(d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]))
+        final: list[Detection] = []
+        for d in out:
+            inside_existing = any(
+                d.bbox[0] >= f.bbox[0] and d.bbox[1] >= f.bbox[1] and
+                d.bbox[2] <= f.bbox[2] and d.bbox[3] <= f.bbox[3]
+                for f in final)
+            if not inside_existing:
+                final.append(d)
+        final.sort(key=lambda dd: -dd.conf)
+        return final
+
     # ------------------------------------------------------------- HSV search
     def _hsv_candidates(self, frame, roi=None, min_area=6.0, max_area_frac=0.01):
         """Кандидаты «похожие на мяч» по выученной HSV-палитре (или яркие круги)."""
@@ -219,6 +290,13 @@ class BallDetector:
         """
         self._last_frame = frame
         yolo_balls, persons = self._yolo_detect(frame)
+        # Fallback-каскад игроков: если YOLO недоступен (ultralytics не
+        # установлен / веса не скачаны) или не нашёл ни одного человека,
+        # боксы игроков достаем классическим CV (фон/передний план). Без
+        # person-детекций ветка contact/release в pipeline бессильна и
+        # пасы не детектятся вовсе (баг «ни реального, ни ложного паса»).
+        if not persons:
+            persons = self._cv_persons(frame)
         strong_yolo = [d for d in yolo_balls if d.conf >= settings.ball_conf_threshold]
         H, W = frame.shape[:2]
 

@@ -1,6 +1,3 @@
-# Compiled and build artifacts
+# Python compiled files
 __pycache__/
 *.pyc
-
-# Media/Render outputs (large binary files)
-data/renders/
