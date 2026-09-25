@@ -1,9 +1,16 @@
-# Python bytecode and cache
+# Compiled/Binary files
 __pycache__/
 *.pyc
 
-# Model weights (large binary files)
-*.pt
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Videos
-*.mp4
+# System/Environment files
+.DS_Store
+Thumbs.db
+.env
+.env.local
+*.env.*
