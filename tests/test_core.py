@@ -198,3 +198,110 @@ class TestRenderer:
         assert _point_at_time(pts, 2.0) == (10.0, 5.0)
         assert _point_at_time(pts, 0.5) is None
         assert _point_at_time(pts, 3.0) == (20.0, 10.0)
+
+
+class TestTrackerAntiJump:
+    """Регрессии на баг «срыв трека»: ложная далёкая детекция не должна
+    перетягивать трекер, а сорванный трек — умирать, а не лететь по экрану."""
+
+    def test_far_false_detection_does_not_hijack_track(self):
+        tr = SORTTracker(min_hits=1)
+        tr.set_frame_size(640, 480)
+        for f in range(5):                      # стабильный мяч в (100..120, 100..120)
+            tr.update(np.array([[100, 100, 120, 120]], float))
+        # ложная сдетектированная «сфера» далеко от реального мяча.
+        # ВНИМАНИЕ: трекер многообъектный — далёкая детекция порождает НОВЫЙ
+        # трек; баг («срыв») был бы, если существующий трек ПЕРЕСКОЧИЛ на неё.
+        out = tr.update(np.array([[500, 400, 520, 420]], float))
+        real = [o for o in out if math.hypot((o[1][0] + o[1][2]) / 2 - 110,
+                                             (o[1][1] + o[1][3]) / 2 - 110) < 60]
+        assert len(real) == 1, \
+            "реальный трек обязан остаться у мяча (не перескочить на ложную детекцию)"
+        # и он именно тот же id, что до ложной детекции
+        assert real[0][0] == min(o[0] for o in out)
+
+    def test_lost_track_dies_instead_of_flying_offscreen(self):
+        tr = SORTTracker(min_hits=1, max_age=5)
+        tr.set_frame_size(640, 480)
+        for f in range(5):
+            x = 580 + 10 * f                    # быстрый мяч уходит за правый край
+            tr.update(np.array([[x, 100, x + 20, 120]], float))
+        gone = False
+        for _ in range(6):
+            out = tr.update(np.empty((0, 4)))
+            if not out:
+                gone = True
+                break
+        assert gone, "сорванный трек обязан умереть, а не продолжать путь по экрану"
+
+
+class TestPassGating:
+    """Мяч отслеживается только во время пасов, а не на всём видео."""
+
+    class _FakeDetector:
+        """Детектор-заглушка: кадры сцены описаны списком (balls, persons)."""
+        def __init__(self, frames):
+            self.frames = list(frames)
+            self.i = 0
+        def detect(self, frame):
+            from app.services.detector import Detection
+            balls, persons = self.frames[min(self.i, len(self.frames) - 1)]
+            self.i += 1
+            b = [Detection(np.array(bb, float), 0.9, 32) for bb in balls]
+            p = [Detection(np.array(bb, float), 0.9, 0) for bb in persons]
+            return b, p
+
+    def _write_video(self, path, n_frames=120):
+        import cv2
+        w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (640, 480))
+        for i in range(n_frames):
+            f = np.full((480, 640, 3), 60, np.uint8)
+            w.write(f)
+        w.release()
+
+    def _scene(self):
+        P1 = [400, 200, 460, 440]   # игрок-отдающий
+        P2 = [100, 200, 160, 440]   # игрок-принимающий
+        held = ([[420, 210, 440, 230]], [P1])          # мяч в зоне P1
+        fly = lambda t: ([[420 - 25 * t, 200 - 5 * math.sin(t), 440 - 25 * t,
+                          220 - 5 * math.sin(t)]], [P1, P2])
+        caught = ([[120, 210, 140, 230]], [P1, P2])    # мяч в зоне P2
+        idle = ([], [P1, P2])                          # мяч вообще не виден
+        frames = []
+        frames += [held] * 8                           # владение P1
+        frames += [fly(t) for t in range(1, 13)]       # полёт паса
+        frames += [caught] * 8                         # приёмка P2
+        frames += [idle] * 40                          # длинный «мёртвый» участок
+        frames += [held] * 4                           # мяч снова у P1 (без полёта)
+        return frames
+
+    def test_only_flight_is_tracked_and_single_pass(self, tmp_path):
+        from app.services.pipeline import analyze_video
+        src = str(tmp_path / "v.mp4")
+        self._write_video(src)
+        an = analyze_video(src, detector=self._FakeDetector(self._scene()))
+        # ровно один пас
+        assert len(an.passes) == 1, f"ожидался 1 пас, получено {len(an.passes)}"
+        p = an.passes[0]
+        # все точки траектории лежат строго внутри окна полёта
+        assert an.ball_track_points, "траектория полёта должна присутствовать"
+        assert all(p.release_frame <= pt["frame"] <= p.catch_frame
+                   for pt in an.ball_track_points), \
+            "вне полёта мяч отслеживаться не должен"
+        # «мёртвая» зона (~50 кадров после приёмки) не порождает новых треков
+        tail = [pt for pt in an.ball_track_points if pt["frame"] > p.catch_frame]
+        assert not tail
+
+    def test_no_release_contact_means_no_pass(self, tmp_path):
+        """Мяч, прилетевший «ниоткуда» (без владения перед релизом), — не пас."""
+        from app.services.pipeline import analyze_video
+        src = str(tmp_path / "v2.mp4")
+        self._write_video(src)
+        P1 = [400, 200, 460, 440]
+        frames = []
+        frames += ([], [P1]) * 5
+        for t in range(1, 15):                        # мяч летит, но владения не было
+            frames.append(([[420 - 20 * t, 200, 440 - 20 * t, 220]], [P1]))
+        an = analyze_video(src, detector=self._FakeDetector(frames))
+        assert len(an.passes) == 0
+        assert len(an.ball_track_points) == 0

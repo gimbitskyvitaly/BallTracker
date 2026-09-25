@@ -67,7 +67,15 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     det = detector or BallDetector()
     tracker = SORTTracker()
-    set_gravity_px(fps, settings.gravity_ratio)
+    tracker.set_frame_size(width, height)   # физический gate от срывов за кадр
+    set_gravity_px(fps, settings.gravity_ratio)   # только для fit'а метрик (px/s^2)
+    # Kalman-модель постоянного ускорения по вертикали: эмпирическое g в
+    # px/frame^2 (НЕ gravity_ratio*fps^2 — это размерность px/s^2 для фита;
+    # подстановка её в трекер разгоняла треки по вертикали — «catch на
+    # потолке», а при другом fps рвала полёт на осколки).
+    # Предел скорости трекера — из физического gate кадра.
+    v_max = settings.max_jump_frac * min(width, height)
+    tracker.set_physics(settings.kalman_gravity_px_f2, max_speed_px_per_f=v_max)
 
     analysis = VideoAnalysis(fps=fps, width=width, height=height, n_frames=0)
 
@@ -77,6 +85,8 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     flight_pts: list[tuple[int, float, float]] = []
     ball_diam_sum, ball_diam_n = 0.0, 0
     frame_id = 0
+    contact_streak = 0        # подряд идущие кадры «мяч в зоне игрока»
+    no_person_frames = 0      # подряд идущие кадры без людей в кадре
 
     while True:
         ok, frame = cap.read()
@@ -98,28 +108,41 @@ def analyze_video(path: str, detector: BallDetector | None = None,
                                                         (t[1][1] + t[1][3]) / 2 - by))
             tb = best[1]
             cx_t, cy_t = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
-            alpha = 0.65   # доверие Kalman-предсказанию при наличии свежей детекции
-            center = (alpha * cx_t + (1 - alpha) * bx, alpha * cy_t + (1 - alpha) * by)
-            tvx, tvy = best[2], best[3]
+            # физический gate на уровне пайплайна: если Kalman-предсказание
+            # уехало далеко от свежей детекции — это сорванный трек, не
+            # подмешиваем его (иначе траектория «тянется» за призраком).
+            jump = math.hypot(cx_t - bx, cy_t - by)
+            max_jump = settings.max_jump_frac * min(width, height)
+            if jump <= max_jump:
+                alpha = 0.65   # доверие Kalman-предсказанию при наличии свежей детекции
+                center = (alpha * cx_t + (1 - alpha) * bx, alpha * cy_t + (1 - alpha) * by)
+                tvx, tvy = best[2], best[3]
+            else:
+                center = (bx, by)     # доверяем только детекции
             used_det = ball_det
         elif ball_det is not None:
             center = ball_det.center
             used_det = ball_det
         elif tracks:      # окклюзия: держимся за предсказание трекера
             tb = tracks[0][1]
-            center = ((tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2)
-            tvx, tvy = tracks[0][2], tracks[0][3]
+            cx_t, cy_t = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
+            # то же ограничение на extrapolation: без наблюдений долго лететь
+            # по инерции нельзя (max_age мал, но и запасной контроль не помеха)
+            max_jump = settings.max_jump_frac * min(width, height) * settings.max_age
+            if prev_ball is not None and math.hypot(cx_t - prev_ball[0],
+                                                    cy_t - prev_ball[1]) > max_jump:
+                center = None
+            else:
+                center = (cx_t, cy_t)
+                tvx, tvy = tracks[0][2], tracks[0][3]
             used_det = None               # диаметра не наблюдаем
         else:
             center = None
 
-        if used_det is not None:
-            diag = used_det.diag
-            ball_diam_sum += min(diag, height * 0.5)
-            ball_diam_n += 1
         if center is not None:
-            analysis.ball_track_points.append(
-                {"frame": frame_id, "x": round(center[0], 1), "y": round(center[1], 1)})
+            prev_ball = center
+        else:
+            prev_ball = None
 
         # --- состояние контакта с игроком -----------------------------------
         nearest_person = None
@@ -140,7 +163,29 @@ def analyze_video(path: str, detector: BallDetector | None = None,
         else:
             touching = False
 
+        # владение засчитываем только после непрерывной серии контактов —
+        # защита от одиночных ложных срабатываний («мяч» рядом с игроком)
         if touching:
+            contact_streak += 1
+        else:
+            contact_streak = 0
+        has_contact = contact_streak >= settings.contact_streak
+
+        # эпизод без людей вообще (повтор/тайм-аут/пустой кадр) — сброс состояния
+        if not persons:
+            no_person_frames += 1
+            if no_person_frames >= settings.no_person_reset:
+                contact_person = None
+                contact_streak = 0
+                if flight_pts:
+                    if len(flight_pts) >= settings.min_flight_frames:
+                        _finalize_pass(analysis, flight_pts, contact_person, None,
+                                       fps, ball_diam_sum / max(ball_diam_n, 1))
+                    flight_pts = []
+        else:
+            no_person_frames = 0
+
+        if has_contact:
             if flight_pts:
                 # приёмка: полёт завершён
                 if len(flight_pts) >= settings.min_flight_frames:
@@ -150,8 +195,10 @@ def analyze_video(path: str, detector: BallDetector | None = None,
             contact_person = nearest_person
         elif center is not None:
             if not flight_pts:
-                # релиз: был контакт и мяч улетел из зоны игрока
-                if contact_person is not None:
+                # релиз: БЫЛО подтверждённое владение и мяч улетел из зоны игрока.
+                # Без владения сегмент не начинаем — мяч отслеживается только
+                # во время пасов, а не на всём видео.
+                if contact_person is not None or not settings.require_release_contact:
                     flight_pts.append((frame_id, center[0], center[1]))
             else:
                 flight_pts.append((frame_id, center[0], center[1]))
@@ -162,7 +209,15 @@ def analyze_video(path: str, detector: BallDetector | None = None,
                 flight_pts = []
                 contact_person = None
 
-        analysis.n_frames = frame_id
+        if used_det is not None:
+            diag = used_det.diag
+            ball_diam_sum += min(diag, height * 0.5)
+            ball_diam_n += 1
+        if center is not None and flight_pts:
+            # В ball_track_points пишем ТОЛЬКО точки активного полёта (пасов):
+            # вне полёта мяч не отслеживаем ни в анализе, ни в рендере.
+            analysis.ball_track_points.append(
+                {"frame": frame_id, "x": round(center[0], 1), "y": round(center[1], 1)})
         if progress_cb and frame_id % 25 == 0:
             progress_cb(frame_id, total)
         if max_frames and frame_id >= max_frames:

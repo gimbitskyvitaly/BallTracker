@@ -1,1 +1,9 @@
-(empty)
+# Python bytecode and cache
+__pycache__/
+*.pyc
+
+# Model weights (large binary files)
+*.pt
+
+# Videos
+*.mp4
