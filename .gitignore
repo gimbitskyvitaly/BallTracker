@@ -1,7 +1,2 @@
-# Compiled files
 __pycache__/
 *.pyc
-
-# Media/Output artifacts (generated renders)
-data/renders/
-videos/

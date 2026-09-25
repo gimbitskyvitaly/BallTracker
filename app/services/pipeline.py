@@ -159,6 +159,15 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     det = detector or BallDetector()
+    # СБРОС СОСТОЯНИЯ МЕЖДУ ВИДЕО (баг «мяч не детектится вообще»): сервис
+    # держит синглтон BallDetector (main.get_detector) — без reset() старый
+    # CSRT-трекер и выученная HSV-палитра липнут к фантому с предыдущего
+    # ролика, и на новом видео мяч не находится ни разу.
+    if hasattr(det, "reset"):
+        try:
+            det.reset()
+        except Exception:  # noqa: BLE001 — мок-детекторы без reset()
+            pass
     tracker = SORTTracker()
     # Отдельный SORT-трекер игроков: даёт СТАБИЛЬНЫЕ track id людей, по ним
     # определяем «тот же игрок / другой игрок» (passer != catcher). Раньше
@@ -185,6 +194,7 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     last_contact_frame: int = 0                  # последний кадр подтверждения владения
     flight_pts: list[tuple[int, float, float]] = []
     ball_diam_sum, ball_diam_n = 0.0, 0
+    ball_radius_guess = settings.ball_radius_default  # радиус для relock_ball
     frame_id = 0
     contact_streak = 0        # подряд идущие кадры «мяч в зоне игрока»
     no_person_frames = 0      # подряд идущие кадры без людей в кадре
@@ -224,6 +234,16 @@ def analyze_video(path: str, detector: BallDetector | None = None,
                 tvx, tvy = best[2], best[3]
             else:
                 center = (bx, by)     # доверяем только детекции
+                # CSRT-трекер детектора «сошёл» с мяча (сорвался на статичный
+                # объект): переинициализируем его по Kalman-позиции, иначе
+                # настоящий летящий мяч больше не будет найден никогда —
+                # полёт рвётся в момент релиза, событий нет (баг).
+                if hasattr(det, "relock_ball"):
+                    try:
+                        det.relock_ball(frame, (cx_t, cy_t),
+                                        max(6.0, ball_radius_guess))
+                    except Exception:  # noqa: BLE001
+                        pass
             used_det = ball_det
         elif ball_det is not None:
             center = ball_det.center
@@ -332,6 +352,7 @@ def analyze_video(path: str, detector: BallDetector | None = None,
             diag = used_det.diag
             ball_diam_sum += min(diag, height * 0.5)
             ball_diam_n += 1
+            ball_radius_guess = max(6.0, min(diag, height * 0.5) / 2.0)
         if center is not None:
             # Траектория пишется ВСЕГДА, когда мяч виден: и во время полёта,
             # и при владении (маркер мяча на видео обязателен — баг «никаких

@@ -91,6 +91,9 @@ class Settings:
     # не фиксируется и пас не детектится.
     cv_person_max_circle_fill: float = float(os.getenv("BT_CV_PERSON_MAX_CIRC", "0.82"))
     min_flight_frames: int = 4      # минимальная длительность полёта в кадрах
+    # Радиус мяча по умолчанию (px) — стартовое значение до первой детекции;
+    # используется pipeline при переинициализации CSRT-трека (relock_ball).
+    ball_radius_default: float = float(os.getenv("BT_BALL_RADIUS_DEFAULT", "10"))
     # Мяч отслеживается ТОЛЬКО во время полёта (pas-by-pass), а не весь ролик:
     # сегмент регистрируется как пас, только если перед ним зафиксирован
     # контакт с игроком (release). НО: на реальных видео COCO-детектор людей
