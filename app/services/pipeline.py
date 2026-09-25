@@ -79,6 +79,23 @@ def _inside(pt: tuple[float, float], rect) -> bool:
     return rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]
 
 
+def _median_filter(a: np.ndarray, k: int = 5) -> np.ndarray:
+    """Медианное сглаживание ряда (окно k, границы — отражением).
+
+    Подавляет одиночные выбросы трека (срыв CSRT на фон/трибуны), которые
+    в сырых координатах ломали все метрики классификатора (_is_pass)."""
+    n = len(a)
+    if n < k:
+        return a.copy()
+    pad = k // 2
+    # отражение границ (как np.pad mode='reflect'), без повторения края
+    left = a[pad:0:-1]                      # a[pad]..a[1]
+    right = a[-2:-pad - 2:-1] if pad <= n - 2 else a[:0]
+    ext = np.concatenate([left, a, right])
+    windows = np.lib.stride_tricks.sliding_window_view(ext, k)[:n]
+    return np.median(windows, axis=-1).astype(float)
+
+
 def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
              catcher: Detection | None, width: int, height: int,
              fps: float) -> bool:
@@ -103,6 +120,13 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
         return False
     xs = np.array([p[1] for p in pts], dtype=float)
     ys = np.array([p[2] for p in pts], dtype=float)
+    # --- медианное сглаживание ---------------------------------------------
+    # Реальные треки зашумлены (Kalman + срывы CSRT на фон): одиночный
+    # ложный «выброс» на сотни пикселей раньше либо раздувал dx (фантомы),
+    # либо, наоборот, ломал окна скорости/вершины. Медианное окно подавляет
+    # выбросы, не срезая реальную дугу.
+    xs = _median_filter(xs, 5)
+    ys = _median_filter(ys, 5)
     span = abs(xs[-1] - xs[0])
     # максимальный горизонтальный пролёт внутри сегмента (устойчив к шуму
     # последних точек Kalman-сглаживания)
@@ -110,20 +134,32 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
     dx = max(dx, span)
     if dx < settings.pass_min_dx_frac * width:
         return False                                   # нет выраженного полёта влево/вправо
-    # скорость релиза: средняя по первым ~3 наблюдениям (мяч только что
-    # отлетел от игрока); медленные движения — это приём, а не передача
-    k = min(3, len(pts) - 1)
-    dt = max(pts[k][0] - pts[0][0], 1)
-    v_release_per_f = math.hypot(xs[k] - xs[0], ys[k] - ys[0]) / dt
-    if v_release_per_f < settings.pass_min_speed_px_f:
+    # Скорость полёта: максимум из средних скоростей на скользящих окнах
+    # (~3 кадров). Раньше измерялась ТОЛЬКО скорость первых 3 кадров после
+    # релиза — но в первые кадры трек всегда «разгоняется» (Kalman сходится,
+    # мяч ещё в доигровой фазе), и реальные быстрые пасы отсеивались как
+    # «медленные». Щадящий режим: считаем полёт быстрым, если он был быстрым
+    # ХОТЬ НА УЧАСТКЕ; медленный приём/доведение таких участков не имеют.
+    n = len(pts)
+    k = min(3, n - 1)
+    v_max = 0.0
+    for i0 in range(n - k):
+        dt = max(pts[i0 + k][0] - pts[i0][0], 1)
+        v = math.hypot(xs[i0 + k] - xs[i0], ys[i0 + k] - ys[i0]) / dt
+        v_max = max(v_max, v)
+    if v_max < settings.pass_min_speed_px_f:
         return False
-    # выраженная дуга: вершина (минимум y, ось вниз) строго внутри полёта и
-    # заметно выше обоих концов; монотонное падение/подъём (атака вниз,
-    # свеча вверх без приёма другим игроком) — не пас
+    # выраженная дуга: вершина (минимум y, ось вниз) внутри полёта и заметно
+    # выше ОДНОГО из концов. Раньше требовалось: вершина строго внутренняя И
+    # выше обоих концов одновременно — любое начало/конец «на подъёме» или
+    # срезанный окклюзией финал убивали настоящий пас. Монотонное движение
+    # (атака вниз / свеча вверх без приёма) при этом по-прежнему отсекается:
+    # у монотонного ряда экстремум лежит на краю, a pass_min_apex_px не
+    # набирается.
     i_apex = int(np.argmin(ys))
-    if not (0 < i_apex < len(pts) - 1):
+    if i_apex <= 0 or i_apex >= n - 1:
         return False
-    apex_lift = min(ys[0], ys[-1]) - float(ys[i_apex])
+    apex_lift = max(float(ys[0]), float(ys[-1])) - float(ys[i_apex])
     if apex_lift < settings.pass_min_apex_px:
         return False                                   # плоский дрейф без параболичности
     if catcher is None:
