@@ -274,7 +274,10 @@ class TestPassGating:
         frames += [fly(t) for t in range(1, 13)]       # полёт паса
         frames += [caught] * 8                         # приёмка P2
         frames += [idle] * 40                          # длинный «мёртвый» участок
-        frames += [held] * 4                           # мяч снова у P1 (без полёта)
+        # мяч снова виден у P1 (без полёта): после долгого перерыва владение
+        # протухло — новый сегмент начинаться не должен
+        again = ([[420, 210, 440, 230]], [P1])
+        frames += [again] * 4
         return frames
 
     def test_only_flight_is_tracked_and_single_pass(self, tmp_path):
@@ -301,9 +304,11 @@ class TestPassGating:
         self._write_video(src)
         P1 = [400, 200, 460, 440]
         frames = []
-        frames += ([], [P1]) * 5          # кортеж (balls, persons), пустые мячи
+        for _ in range(5):                            # мяча нет, люди есть
+            frames.append(([], [P1]))
         for t in range(1, 15):                        # мяч летит, но владения не было
-            frames.append(([[420 - 20 * t, 200, 440 - 20 * t, 220]], [P1]))
+            x = 420 - 20 * t
+            frames.append(([[x, 200, x + 20, 220]], [P1]))
         an = analyze_video(src, detector=self._FakeDetector(frames))
         assert len(an.passes) == 0
         assert len(an.ball_track_points) == 0

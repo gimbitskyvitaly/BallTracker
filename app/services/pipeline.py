@@ -117,9 +117,15 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
     if apex_lift < settings.pass_min_apex_px:
         return False                                   # плоский дрейф без параболичности
     if catcher is None:
-        # приёмки не зафиксировано: допускаем только длинный пролёт (>15% кадра),
-        # чтобы обрывки треков не плодили фантомные пасы
-        return dx >= 0.15 * width
+        # Приёмка не зафиксирована. Это НОРМАЛЬНО для реальных видео: COCO-
+        # детектор людей не стабилен (игроки слиты/в кадре только ноги), поэтому
+        # требовать «catch другим игроком» как обязательное условие — значит
+        # потерять все реальные пасы (баг «пас вообще не детектится»).
+        # Без приёмки подтверждаем пас физикой полёта: дуга уже проверена выше,
+        # теперь требуем достаточно длинный горизонтальный пролёт
+        # (pass_no_catch_min_dx_frac), чтобы короткие отскоки/шум трека
+        # не плодили фантомные события.
+        return dx >= settings.pass_no_catch_min_dx_frac * width
     if passer is not None:
         same_center = math.hypot(passer.center[0] - catcher.center[0],
                                  passer.center[1] - catcher.center[1]) \
@@ -272,13 +278,14 @@ def analyze_video(path: str, detector: BallDetector | None = None,
             last_contact_frame = frame_id
         elif center is not None:
             if not flight_pts:
-                # релиз: БЫЛО подтверждённое владение и мяч отлетел от игрока.
-                # Без свежего владения сегмент не начинаем — мяч отслеживается
-                # только во время пасов, а не на всём видео (защита от
-                # «призрачных» полётов после потери трека).
-                fresh = (frame_id - last_contact_frame) <= settings.release_max_lag
-                if (contact_person is not None and fresh) \
-                        or not settings.require_release_contact:
+                # Релиз. Если владение подтверждено (свежий контакт с игроком) —
+                # сегмент начинаем всегда. Если нет — только при отключённом
+                # строгом требовании BT_REQUIRE_CONTACT и ТОЛЬКО когда в кадре
+                # есть люди: без person-детекций пас неоткуда брать, а мяч,
+                # летящий «в пустом» кадре, — почти всегда артефакт трека.
+                fresh = contact_person is not None \
+                    and (frame_id - last_contact_frame) <= settings.release_max_lag
+                if fresh or (not settings.require_release_contact and persons):
                     flight_pts.append((frame_id, center[0], center[1]))
             else:
                 flight_pts.append((frame_id, center[0], center[1]))

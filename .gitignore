@@ -1,16 +1,6 @@
-# Compiled/Binary files
+# Compiled and build artifacts
 __pycache__/
 *.pyc
 
-# Editor/IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# System/Environment files
-.DS_Store
-Thumbs.db
-.env
-.env.local
-*.env.*
+# Media/Render outputs (large binary files)
+data/renders/
