@@ -263,8 +263,10 @@ class TestPassGating:
         P1 = [400, 200, 460, 440]   # игрок-отдающий
         P2 = [100, 200, 160, 440]   # игрок-принимающий
         held = ([[420, 210, 440, 230]], [P1])          # мяч в зоне P1
-        fly = lambda t: ([[420 - 25 * t, 200 - 5 * math.sin(t), 440 - 25 * t,
-                          220 - 5 * math.sin(t)]], [P1, P2])
+        # выраженная параболическая дуга влево: вершина ~55 px над концами
+        fly = lambda t: ([[420 - 25 * t, 210 - 55 * math.sin(math.pi * t / 13),
+                          440 - 25 * t, 230 - 55 * math.sin(math.pi * t / 13)]],
+                         [P1, P2])
         caught = ([[120, 210, 140, 230]], [P1, P2])    # мяч в зоне P2
         idle = ([], [P1, P2])                          # мяч вообще не виден
         frames = []
@@ -272,7 +274,10 @@ class TestPassGating:
         frames += [fly(t) for t in range(1, 13)]       # полёт паса
         frames += [caught] * 8                         # приёмка P2
         frames += [idle] * 40                          # длинный «мёртвый» участок
-        frames += [held] * 4                           # мяч снова у P1 (без полёта)
+        # мяч снова виден у P1 (без полёта): после долгого перерыва владение
+        # протухло — новый сегмент начинаться не должен
+        again = ([[420, 210, 440, 230]], [P1])
+        frames += [again] * 4
         return frames
 
     def test_only_flight_is_tracked_and_single_pass(self, tmp_path):
@@ -299,9 +304,81 @@ class TestPassGating:
         self._write_video(src)
         P1 = [400, 200, 460, 440]
         frames = []
-        frames += ([], [P1]) * 5
+        for _ in range(5):                            # мяча нет, люди есть
+            frames.append(([], [P1]))
         for t in range(1, 15):                        # мяч летит, но владения не было
-            frames.append(([[420 - 20 * t, 200, 440 - 20 * t, 220]], [P1]))
+            x = 420 - 20 * t
+            frames.append(([[x, 200, x + 20, 220]], [P1]))
         an = analyze_video(src, detector=self._FakeDetector(frames))
         assert len(an.passes) == 0
         assert len(an.ball_track_points) == 0
+
+    # ---- Регрессия бага «4 паса за розыгрыш» --------------------------------
+    def _rally_scene(self):
+        """Волейбольный розыгрыш: подача (вертикальный удар), приём (медленно
+        вверх к тому же игроку), ПАС по параболе влево другому игроку, атака
+        (монотонное падение вниз). Реальный пас — ровно один."""
+        S = [560, 300, 620, 470]     # подающий у правой линии
+        P1 = [380, 250, 440, 460]    # связующий (отдаёт пас)
+        P2 = [120, 250, 180, 460]    # принимающий пас
+        A = [300, 200, 360, 420]     # атакующий
+        persons = [S, P1, P2, A]
+        f = []
+        # 1) ПОДАЧА: подброс вверх (к тому же игроку) и вертикальный полёт
+        f += [([[590, 300, 610, 320]], persons)] * 3
+        for t in range(1, 11):                       # мяч почти вертикально вверх
+            y = 300 - 18 * t
+            f.append(([[588 - 0.6 * t, y, 608 - 0.6 * t, y + 20]], persons))
+        for t in range(1, 6):                        # удар вниз к сетке (мало dx)
+            y = 120 + 25 * t
+            f.append(([[582 - 1.0 * t, y, 602 - 1.0 * t, y + 20]], persons))
+        # 2) ПРИЁМ: медленное движение вверх-вправо к связующему (скорость < 3 px/f)
+        for t in range(1, 13):
+            x = 560 - 12.0 * t                       # медленно
+            y = 250 - 1.2 * t
+            f.append(([[x, y, x + 20, y + 20]], persons))
+        f += ([[420, 240, 440, 260]], persons) * 3   # мяч в зоне P1 — владение
+        # 3) ПАС: выраженная парабола влево от P1 к P2
+        for t in range(1, 13):
+            x = 420 - 25 * t
+            y = 250 - 60 * math.sin(math.pi * t / 13)
+            f.append(([[x, y, x + 20, y + 20]], persons))
+        f += ([[130, 250, 150, 270]], persons) * 3   # приёмка P2
+        # 4) АТАКА: от P2 вверх-вправо к A и монотонное падение вниз (без дуги
+        #    над концами) — не пас
+        for t in range(1, 9):
+            x = 140 + 20 * t
+            y = 250 - 30 + 8 * t * t / 2
+            f.append(([[x, y, x + 20, y + 20]], persons))
+        f += ([[320, 300, 340, 320]], persons) * 3   # касание A
+        for t in range(1, 11):                       # резкое монотонное падение
+            y = 320 + 20 * t
+            f.append(([[318, y, 338, y + 20]], persons))
+        return f
+
+    def test_rally_counts_only_real_pass(self, tmp_path):
+        """Подача, приём и атака НЕ должны детектиться как пасы: за розыгрыш
+        сервис обязан вернуть ровно 1 событие (передачу по параболе влево)."""
+        from app.services.pipeline import analyze_video
+        src = str(tmp_path / "rally.mp4")
+        self._write_video(src, n_frames=len(self._rally_scene()) + 5)
+        an = analyze_video(src, detector=self._FakeDetector(self._rally_scene()))
+        assert len(an.passes) == 1, \
+            f"за розыгрыш должен регистрироваться 1 пас, получено {len(an.passes)}"
+        p = an.passes[0]
+        # это именно передача P1 -> P2 (слева направо координаты отдающего больше)
+        assert p.passer_bbox[0] > 300 and p.catcher_bbox is not None \
+            and p.catcher_bbox[0] < 250
+
+    def test_vertical_serve_is_not_a_pass(self, tmp_path):
+        """Изолированная подача (вертикальный удар без смены игрока) — не пас."""
+        from app.services.pipeline import analyze_video
+        src = str(tmp_path / "serve.mp4")
+        S = [560, 300, 620, 470]
+        frames = [([[590, 300, 610, 320]], [S])] * 4
+        for t in range(1, 16):
+            y = 300 - 15 * t
+            frames.append(([[585, y, 605, y + 20]], [S]))
+        self._write_video(src, n_frames=len(frames) + 5)
+        an = analyze_video(src, detector=self._FakeDetector(frames))
+        assert len(an.passes) == 0

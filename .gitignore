@@ -1,9 +1,7 @@
-# Python bytecode and cache
+# Compiled and build artifacts
 __pycache__/
 *.pyc
 
-# Model weights (large binary files)
-*.pt
-
-# Videos
-*.mp4
+# Dependencies
+venv/
+.venv/
