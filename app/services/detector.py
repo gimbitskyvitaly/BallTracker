@@ -97,6 +97,25 @@ class BallDetector:
         self._ball_hsv_ranges = []  # выученная палитра мяча [(lo, hi), ...]
         self._last_frame = None
         self._prev_small = None    # для motion-prior затравки (seed_ball)
+        # --- анти-залипание CSRT (баг «мяч виден лишь в редкие промежутки,
+        # метки прыгают по разным местам»): трекер систематически срывается
+        # на крупные статичные объекты фона и «застывает» на них. Ведём
+        # статистику движения последних N боксов: если бокс не двигается,
+        # а вокруг есть реальное движение — трек признан фантомом, он
+        # сбрасывается и мяч перевхватывается (motion-seed / HSV).
+        self._box_hist: list[tuple[float, float, float, float]] = []  # центры bbox
+        self._frozen_streak = 0
+        self._ghost_bboxes: list[tuple[float, float, float, float]] = []  # запомненные фантомы
+        self._frozen_disable = int(os.getenv("BT_FROZEN_DISABLE", "6"))
+        self._freeze_frames = int(os.getenv("BT_FREEZE_FRAMES", "4"))
+        self._freeze_px = float(os.getenv("BT_FREEZE_PX", "2.5"))
+        self._freeze_motion_thr = float(os.getenv("BT_FREEZE_MOTION_THR", "12"))
+        self._gray_prev = None
+        self._gray_small = None
+        # анти-залипание: сколько кадров после изгнания фантома не разрешать
+        # HSV-перехват в его окрестности (0 — отключить механизм)
+        self._ghost_cooldown = int(os.getenv("BT_GHOST_COOLDOWN", "12"))
+        self._frames_since_ghost = 999
         # CV-fallback игроков (background subtraction): создаётся один раз,
         # модель фона «помнит» сцену между кадрами; сбрасывается в reset().
         from app.services.persons import PersonDetectorCV
@@ -116,8 +135,97 @@ class BallDetector:
         self._ball_hsv_ranges = []
         self._last_frame = None
         self._prev_small = None
+        self._box_hist = []
+        self._frozen_streak = 0
+        self._ghost_bboxes = []
+        self._gray_prev = None
+        self._gray_small = None
         from app.services.persons import PersonDetectorCV
         self._person_cv = PersonDetectorCV(person_cls=self.PERSON_CLS)
+
+    # ------------------------------------------------- анти-залипание (freeze)
+    def _surrounding_motion(self, frame) -> float:
+        """Средняя яркость absdiff вокруг текущего бокса трека (в малом масштабе).
+
+        Нужен, чтобы отличить «трек застыл, потому что мяч в покое у игрока»
+        (вокруг тихо) от «трек застыл на статичном фоне, а настоящий мяч
+        летит/движется рядом» (вокруг шумно). Возвращает 0 при первом кадре.
+        """
+        small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+                           None, fx=0.25, fy=0.25)
+        if self._gray_small is None:
+            self._gray_small = small
+            return 0.0
+        md = cv2.absdiff(small, self._gray_small)
+        self._gray_small = small
+        mb = cv2.GaussianBlur(md, (0, 0), 3)
+        if self._tracker_bbox is None:
+            return float(mb.mean())
+        x, y, w, h = self._tracker_bbox
+        H, W = mb.shape
+        cx, cy = int(0.25 * (x + w / 2)), int(0.25 * (y + h / 2))
+        r = max(6, int(0.25 * max(w, h) * 4))
+        win = mb[max(0, cy - r):min(H, cy + r), max(0, cx - r):min(W, cx + r)]
+        return float(win.mean()) if win.size else 0.0
+
+    def _is_ghost_box(self, bb) -> bool:
+        """Бокс кандидата совпадает с уже изгнанным фантомом?
+
+        Cooldown (BT_GHOST_COOLDOWN кадров): сразу после изгнания запрещаем
+        HSV-перехват в окрестности фантома — иначе трек мгновенно садится
+        на него обратно. По истечении cooldown запрет снимается: если мяч
+        ДЕЙСТВИТЕЛЬНО стоит у игрока на том же месте, это уже не фантом,
+        а настоящий мяч (баг «после 38 кадра мяч пропал» был именно из-за
+        вечного бана зоны покоя мяча).
+        """
+        if self._frames_since_ghost <= self._ghost_cooldown:
+            pass  # активный cooldown: ghosts работают
+        else:
+            return False
+        x, y, w, h = bb
+        cx, cy = x + w / 2, y + h / 2
+        for gx, gy, gw, gh in self._ghost_bboxes[-8:]:
+            if abs(cx - (gx + gw / 2)) < max(gw, 30) and \
+               abs(cy - (gy + gh / 2)) < max(gh, 30):
+                return True
+        return False
+
+    def _note_track_pos(self, bb) -> None:
+        """Обновление счётчика «замороженного» трека + изгнание фантома."""
+        x, y, w, h = bb
+        c = (x + w / 2, y + h / 2)
+        self._box_hist.append((c[0], c[1], w, h))
+        del self._box_hist[:-max(2, self._freeze_frames + 1)]
+        if len(self._box_hist) >= self._freeze_frames + 1:
+            p0 = self._box_hist[-self._freeze_frames - 1]
+            disp = math.hypot(c[0] - p0[0], c[1] - p0[1])
+            if disp < self._freeze_px:
+                self._frozen_streak += 1
+            else:
+                self._frozen_streak = 0
+
+    def _freeze_check_release(self, frame) -> bool:
+        """Если трек заморожен при наличии движения вокруг — сбросить его.
+
+        Возвращает True, если трек был сброшен как фантом (мяч будет
+        перевхвачен в этом же кадре через HSV/motion-seed).
+        """
+        if self._frozen_streak < self._freeze_frames or \
+           self._frozen_disable <= 0 or self._tracker_bbox is None:
+            return False
+        motion = self._surrounding_motion(frame)
+        if motion < self._freeze_motion_thr:
+            return False   # сцена тихая: мяч реально в покое — не трогаем
+        # запоминаем фантом, чтобы не сесть на него же на следующем кадре
+        self._ghost_bboxes.append(tuple(self._tracker_bbox))
+        del self._ghost_bboxes[:-12]
+        self._frames_since_ghost = 0
+        self._tracker = None
+        self._tracker_bbox = None
+        self._box_hist = []
+        self._frozen_streak = 0
+        self._lost_frames = 0
+        return True
 
     # ------------------------------------------------------------------ YOLO
     def _ensure_model(self):
@@ -346,7 +454,18 @@ class BallDetector:
         release/catch тогда выводятся по геометрии траектории в pipeline).
         """
         self._last_frame = frame
+        self._frames_since_ghost += 1
         yolo_balls, persons = self._yolo_detect(frame)
+        # Анти-залипание: если CSRT «окоченел» на статичном фоне при живом
+        # движении вокруг — сбрасываем его ДО попытки update (баг: метки
+        # мяча появляются лишь в редкие промежутки, трек липнет к фантомам).
+        ghost_dropped = self._freeze_check_release(frame)
+        # последняя «живая» позиция трека (до изгнания фантома) — подсказка
+        # для HSV-перехвата и Kalman-сглаживания в pipeline
+        prev_center_hint = None
+        if self._box_hist:
+            bx_, by_, bw_, bh_ = self._box_hist[-1]
+            prev_center_hint = (bx_, by_)
         # Fallback-каскад игроков: если YOLO недоступен (ultralytics не
         # установлен / веса не скачаны) или не нашёл ни одного человека,
         # боксы игроков достаем классическим CV (фон/передний план). Без
@@ -370,6 +489,7 @@ class BallDetector:
                 if w > 2 and h > 2 and w * h < 0.05 * W * H:
                     self._tracker_bbox = (x, y, w, h)
                     self._lost_frames = 0
+                    self._note_track_pos(self._tracker_bbox)
                     det = Detection(np.array([x, y, x + w, y + h]), conf=0.9, cls=self.BALL_CLS)
                     # редкая сверка с YOLO: если тот уверенно видит мяч далеко
                     # от трекера — верим ему (переинициализация)
@@ -397,6 +517,13 @@ class BallDetector:
             x, y, w, h = self._tracker_bbox
             pad = max(4 * w, 4 * h, 60) + 12 * self._lost_frames
             roi = (int(x - pad), int(y - pad), int(x + w + pad), int(y + h + pad))
+        elif ghost_dropped and prev_center_hint is not None:
+            # трек только что сошёл с мяча на статичный фон: HSV-поиск вокруг
+            # ПОСЛЕДНЕЙ ЖИВОЙ позиции (а не вокруг фантома) — так трек
+            # возвращается на летящий мяч в том же кадре
+            px, py = prev_center_hint
+            pad = max(80.0, 0.15 * min(W, H))
+            roi = (int(px - pad), int(py - pad), int(px + pad), int(py + pad))
         elif self._ball_hsv_ranges:
             # палитра выучена, но трек потерян окончательно — ищем новый
             # мяч глобально (размерный фильтр всё ещё защищает от фона)
@@ -404,6 +531,10 @@ class BallDetector:
         cands = self._hsv_candidates(frame, roi=roi)
         if not cands and strong_yolo:
             cands = strong_yolo[:1]
+        # изгнанные фантомы отбрасываем даже при HSV-перехвате (иначе трек
+        # мгновенно возвращается на застывший объект)
+        cands = [c for c in cands if not self._is_ghost_box(
+            (c.bbox[0], c.bbox[1], c.bbox[2] - c.bbox[0], c.bbox[3] - c.bbox[1]))]
         if cands:
             best = cands[0]
             self._reinit_tracker(best.bbox)
@@ -417,6 +548,13 @@ class BallDetector:
         # 3) ничего не ведём: пробуем затравку по движению (motion prior),
         #    затем отдаём то, что видит YOLO (порог конф. применён).
         if not strong_yolo and self._tracker_bbox is None:
+            # сразу после изгнания фантома перевхватываем мяч по движению —
+            # это основной механизм восстановления трека на реальных видео
+            if self.seed_ball(frame, allow_reseed=True):
+                if self._tracker is not None:
+                    x, y, w, h = self._tracker_bbox
+                    return [Detection(np.array([x, y, x + w, y + h]),
+                                      conf=0.6, cls=self.BALL_CLS)], persons
             self.seed_ball(frame)
             if self._tracker is not None:
                 return [Detection(np.array([self._tracker_bbox[0],
@@ -426,8 +564,12 @@ class BallDetector:
                                   conf=0.5, cls=self.BALL_CLS)], persons
         return strong_yolo, persons
 
-    def seed_ball(self, frame: np.ndarray):
+    def seed_ball(self, frame: np.ndarray, allow_reseed: bool = False):
         """Авто-затравка трека мяча по статистике движения (motion prior).
+
+        allow_reseed=True — разрешает перевхват даже при уже выученной
+        HSV-палитре (используется сразу после изгнания «замороженного»
+        фантома, чтобы вернуть трек на настоящий движущийся мяч).
 
         Классический приём sports-analytics: там, где между кадрами есть
         устойчивое движение и при этом в кадре присутствуют компактные
@@ -472,6 +614,15 @@ class BallDetector:
         if best is None:
             return False
         cx, cy, d = best[1], best[2], best[3]
+        bb = (cx - d / 2, cy - d / 2, d, d)
+        # не садимся на изгнанный фантом; при обычном старте (палитра уже
+        # выучена и трек просто ещё не подхвачен) перевхват по движению
+        # отключён — иначе seed может «увести» трек на игрока в момент
+        # покоя мяча. allow_reseed=True снимает только ограничение палитры.
+        if self._is_ghost_box(bb):
+            return False
+        if not allow_reseed and self._ball_hsv_ranges:
+            return False
         self._reinit_tracker(np.array([cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2]))
         self._learn_palette(frame, [cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2])
         return True
@@ -484,6 +635,8 @@ class BallDetector:
             self._tracker.init(self._last_frame, tuple(int(v) for v in bb))
         self._tracker_bbox = bb
         self._lost_frames = 0
+        self._box_hist = []
+        self._frozen_streak = 0
 
     def relock_ball(self, frame: np.ndarray, center: tuple[float, float],
                     radius_px: float) -> None:

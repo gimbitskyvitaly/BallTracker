@@ -79,6 +79,23 @@ def _inside(pt: tuple[float, float], rect) -> bool:
     return rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]
 
 
+def _median_filter(a: np.ndarray, k: int = 5) -> np.ndarray:
+    """Медианное сглаживание ряда (окно k, границы — отражением).
+
+    Подавляет одиночные выбросы трека (срыв CSRT на фон/трибуны), которые
+    в сырых координатах ломали все метрики классификатора (_is_pass)."""
+    n = len(a)
+    if n < k:
+        return a.copy()
+    pad = k // 2
+    # отражение границ (как np.pad mode='reflect'), без повторения края
+    left = a[pad:0:-1]                      # a[pad]..a[1]
+    right = a[-2:-pad - 2:-1] if pad <= n - 2 else a[:0]
+    ext = np.concatenate([left, a, right])
+    windows = np.lib.stride_tricks.sliding_window_view(ext, k)[:n]
+    return np.median(windows, axis=-1).astype(float)
+
+
 def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
              catcher: Detection | None, width: int, height: int,
              fps: float) -> bool:
@@ -103,6 +120,13 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
         return False
     xs = np.array([p[1] for p in pts], dtype=float)
     ys = np.array([p[2] for p in pts], dtype=float)
+    # --- медианное сглаживание ---------------------------------------------
+    # Реальные треки зашумлены (Kalman + срывы CSRT на фон): одиночный
+    # ложный «выброс» на сотни пикселей раньше либо раздувал dx (фантомы),
+    # либо, наоборот, ломал окна скорости/вершины. Медианное окно подавляет
+    # выбросы, не срезая реальную дугу.
+    xs = _median_filter(xs, 5)
+    ys = _median_filter(ys, 5)
     span = abs(xs[-1] - xs[0])
     # максимальный горизонтальный пролёт внутри сегмента (устойчив к шуму
     # последних точек Kalman-сглаживания)
@@ -110,20 +134,32 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
     dx = max(dx, span)
     if dx < settings.pass_min_dx_frac * width:
         return False                                   # нет выраженного полёта влево/вправо
-    # скорость релиза: средняя по первым ~3 наблюдениям (мяч только что
-    # отлетел от игрока); медленные движения — это приём, а не передача
-    k = min(3, len(pts) - 1)
-    dt = max(pts[k][0] - pts[0][0], 1)
-    v_release_per_f = math.hypot(xs[k] - xs[0], ys[k] - ys[0]) / dt
-    if v_release_per_f < settings.pass_min_speed_px_f:
+    # Скорость полёта: максимум из средних скоростей на скользящих окнах
+    # (~3 кадров). Раньше измерялась ТОЛЬКО скорость первых 3 кадров после
+    # релиза — но в первые кадры трек всегда «разгоняется» (Kalman сходится,
+    # мяч ещё в доигровой фазе), и реальные быстрые пасы отсеивались как
+    # «медленные». Щадящий режим: считаем полёт быстрым, если он был быстрым
+    # ХОТЬ НА УЧАСТКЕ; медленный приём/доведение таких участков не имеют.
+    n = len(pts)
+    k = min(3, n - 1)
+    v_max = 0.0
+    for i0 in range(n - k):
+        dt = max(pts[i0 + k][0] - pts[i0][0], 1)
+        v = math.hypot(xs[i0 + k] - xs[i0], ys[i0 + k] - ys[i0]) / dt
+        v_max = max(v_max, v)
+    if v_max < settings.pass_min_speed_px_f:
         return False
-    # выраженная дуга: вершина (минимум y, ось вниз) строго внутри полёта и
-    # заметно выше обоих концов; монотонное падение/подъём (атака вниз,
-    # свеча вверх без приёма другим игроком) — не пас
+    # выраженная дуга: вершина (минимум y, ось вниз) внутри полёта и заметно
+    # выше ОДНОГО из концов. Раньше требовалось: вершина строго внутренняя И
+    # выше обоих концов одновременно — любое начало/конец «на подъёме» или
+    # срезанный окклюзией финал убивали настоящий пас. Монотонное движение
+    # (атака вниз / свеча вверх без приёма) при этом по-прежнему отсекается:
+    # у монотонного ряда экстремум лежит на краю, a pass_min_apex_px не
+    # набирается.
     i_apex = int(np.argmin(ys))
-    if not (0 < i_apex < len(pts) - 1):
+    if i_apex <= 0 or i_apex >= n - 1:
         return False
-    apex_lift = min(ys[0], ys[-1]) - float(ys[i_apex])
+    apex_lift = max(float(ys[0]), float(ys[-1])) - float(ys[i_apex])
     if apex_lift < settings.pass_min_apex_px:
         return False                                   # плоский дрейф без параболичности
     if catcher is None:
@@ -187,6 +223,7 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     tracker.set_physics(settings.kalman_gravity_px_f2, max_speed_px_per_f=v_max)
 
     analysis = VideoAnalysis(fps=fps, width=width, height=height, n_frames=0)
+    flow_ball = RobustFlowBall(width, height) if settings.use_flow_detector else None
 
     prev_ball: tuple[float, float] | None = None
     contact_person: Detection | None = None      # игрок, державший мяч
@@ -198,6 +235,8 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     frame_id = 0
     contact_streak = 0        # подряд идущие кадры «мяч в зоне игрока»
     no_person_frames = 0      # подряд идущие кадры без людей в кадре
+    recent_centers: list[tuple[float, float]] = []   # для детекта «застывшего» трека
+    stall_count = 0
 
     while True:
         ok, frame = cap.read()
@@ -205,6 +244,14 @@ def analyze_video(path: str, detector: BallDetector | None = None,
             break
         frame_id += 1
         balls, persons = det.detect(frame)
+
+        # --- Robust Flow: независимые кандидаты «движущегося мяча» ----------
+        flow_cands: list[tuple[float, float]] = []
+        if flow_ball is not None and frame_id % max(1, settings.flow_skip_frames) == 0:
+            try:
+                flow_cands = flow_ball.update(frame)
+            except Exception:  # noqa: BLE001 — поток не должен валить анализ
+                flow_cands = []
 
         ball_det: Detection | None = balls[0] if balls else None
         dets_arr = np.array([b.bbox for b in balls[:3]]) if balls else np.empty((0, 4))
@@ -264,6 +311,87 @@ def analyze_video(path: str, detector: BallDetector | None = None,
         else:
             center = None
 
+        # --- Robust Flow arbitration ----------------------------------------
+        # 1) «Застывший» трек (CSRT на статичном фоне): позиция почти не
+        #    меняется несколько кадров, а рядом есть ДВИЖУЩИЙСЯ поток-кандидат
+        #    -> доверяем потоку: смещаем центр и переинициализируем CSRT
+        #    (relock_ball), иначе метки «липнут» к одному месту и мяч виден
+        #    лишь в редкие промежутки.
+        if center is not None:
+            recent_centers.append(center)
+            del recent_centers[:-6]
+            if len(recent_centers) >= max(2, settings.flow_relock_stall_frames):
+                win = recent_centers[-settings.flow_relock_stall_frames:] \
+                    if settings.flow_relock_stall_frames > 1 else recent_centers[-2:]
+                spread = max(math.hypot(p[0] - q[0], p[1] - q[1])
+                             for i, p in enumerate(win) for q in win[i + 1:]) \
+                    if len(win) > 1 else 999.0
+                stalled = spread < max(2.0, 0.004 * min(width, height))
+                stall_count = stall_count + 1 if stalled else 0
+            else:
+                stall_count = 0
+            if (stall_count >= settings.flow_relock_stall_frames and flow_cands
+                    and ball_det is not None):
+                near = [c for c in flow_cands
+                        if math.hypot(c[0] - center[0], c[1] - center[1])
+                        <= settings.max_jump_frac * min(width, height)]
+                far_any = any(math.hypot(c[0] - center[0], c[1] - center[1])
+                              > max(8.0, 0.02 * min(width, height))
+                              for c in flow_cands)
+                if near and far_any:
+                    fc = min(near, key=lambda c: math.hypot(
+                        c[0] - center[0], c[1] - center[1]))
+                    center = fc
+                    r = max(6.0, ball_radius_guess)
+                    if hasattr(det, "relock_ball"):
+                        try:
+                            det.relock_ball(frame, fc, r)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    tracker.reset_all()
+                    recent_centers.clear()
+                    stall_count = 0
+        # 2) Мяч вообще не виден, но поток находит компактные движущиеся
+        #    blob'ы — берём ближайший к последней позиции как кандидата
+        #    (восстановление после потери трека).
+        if center is None and flow_cands and prev_ball is not None:
+            best_fc = min(flow_cands, key=lambda c: math.hypot(
+                c[0] - prev_ball[0], c[1] - prev_ball[1]))
+            if math.hypot(best_fc[0] - prev_ball[0],
+                          best_fc[1] - prev_ball[1]) \
+                    <= settings.max_jump_frac * min(width, height):
+                center = best_fc
+                if hasattr(det, "relock_ball"):
+                    try:
+                        det.relock_ball(frame, best_fc,
+                                        max(6.0, ball_radius_guess))
+                    except Exception:  # noqa: BLE001
+                        pass
+        if center is None:
+            recent_centers.clear()
+            stall_count = 0
+
+        if center is not None:
+            # Анти-разлёт (баг «метки прыгают по разным местам»): Kalman-
+            # сглаживание на единичных ложных детекциях улетает в стратосферу
+            # (y~30 при потолке трека ~250) и потом тянет за собой все метки.
+            # Одиночный скакун не имеет права двигать трек дальше физичного
+            # предела — заменяем его предсказанием предыдущего трека.
+            if prev_ball is not None:
+                dy_max = settings.max_jump_frac * min(width, height)
+                dx_max = 0.6 * dy_max          # горизонталь мяча за кадр меньше вертикали
+                if abs(center[1] - prev_ball[1]) > dy_max or \
+                   abs(center[0] - prev_ball[0]) > dx_max:
+                    # позиция из калмана уже учтена в center; здесь режем
+                    # только явные телепорты относительно ПРЕДЫДУЩЕЙ позиции
+                    if tracks:
+                        tb_ = tracks[0][1]
+                        cx_p, cy_p = (tb_[0] + tb_[2]) / 2, (tb_[1] + tb_[3]) / 2
+                        if math.hypot(cx_p - prev_ball[0], cy_p - prev_ball[1]) <= dy_max:
+                            center = (cx_p, cy_p)
+                            used_det = None    # диаметра не доверяем скакуну
+                        else:
+                            center = None      # ни детекции, ни треку верить нельзя
         if center is not None:
             prev_ball = center
         else:
@@ -392,6 +520,61 @@ def _finalize_segment(analysis: VideoAnalysis, pts, passer: Detection | None,
 
 def ball_diam_sum_px(analysis: VideoAnalysis) -> float:
     return analysis.ball_radius_px * 2.0
+
+
+class RobustFlowBall:
+    """Кандидаты мяча по dense optical flow (Farneback).
+
+    Мотивация (реальное видео VID_20260925_163505.mp4): CSRT+HSV срывается на
+    статичные объекты — метки мяча появляются «в редкие промежутки, часто в
+    совершенно разных местах». Поток находит ДВИЖУЩИЕСЯ компактные области
+    независимо от цвета и состояния трекера; pipeline использует их чтобы
+    (а) матчить/подтверждать позицию мяча и (б) перезахватывать «застывший»
+    трек. Считается каждые settings.flow_skip_frames кадров (дорого).
+    """
+
+    def __init__(self, width: int, height: int):
+        self._prev_gray: np.ndarray | None = None
+        self._scale_x = 1.0
+        self._scale_y = 1.0
+        small_w = max(160, min(width // 2, 640))
+        self._small_w = small_w
+        self._scale_x = width / small_w
+        self._scale_y = height / (small_w * height / width)  # сохраняем аспект
+
+    def update(self, frame: np.ndarray) -> list[tuple[float, float]]:
+        """Список центров кандидатов (x, y) в координатах полного кадра."""
+        h, w = frame.shape[:2]
+        small_h = int(round(self._small_w * h / w))
+        gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+                          (self._small_w, small_h))
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        if self._prev_gray is None:
+            self._prev_gray = gray
+            return []
+        flow = cv2.calcOpticalFlowFarneback(
+            self._prev_gray, gray, None,
+            pyr_scale=0.5, levels=3, winsize=13, iterations=3,
+            poly_n=5, poly_sigma=1.1, flags=0)
+        self._prev_gray = gray
+        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        thr = max(settings.flow_min_mag, float(np.percentile(mag, 92)))
+        mask = (mag >= thr).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        area_frac_full = w * h
+        min_area = max(4.0, settings.flow_min_area_frac *
+                       self._small_w * small_h)
+        max_area = settings.flow_max_area_frac * area_frac_full \
+            / (self._scale_x * self._scale_y)
+        n, _, stats, cents = cv2.connectedComponentsWithStats(mask)
+        out: list[tuple[float, float]] = []
+        for i in range(1, n):
+            a = float(stats[i, cv2.CC_STAT_AREA])
+            if not (min_area <= a <= max_area):
+                continue
+            cx, cy = cents[i]
+            out.append((cx * self._scale_x, cy * (h / small_h)))
+        return out
 
 
 def _finalize_pass(analysis: VideoAnalysis, pts, passer: Detection | None,

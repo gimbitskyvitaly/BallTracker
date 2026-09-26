@@ -94,6 +94,21 @@ class Settings:
     # Радиус мяча по умолчанию (px) — стартовое значение до первой детекции;
     # используется pipeline при переинициализации CSRT-трека (relock_ball).
     ball_radius_default: float = float(os.getenv("BT_BALL_RADIUS_DEFAULT", "10"))
+
+    # --- Robust Flow (опционально): dense optical flow как ДОПОЛНИТЕЛЬНЫЙ
+    # источник кандидатов мяча. На реальных видео CSRT+HSV срывается на
+    # статичные объекты («мяч появляется в редкие промежутки, часто в
+    # совершенно разных местах»): Farneback-поток находит движущиеся
+    # компактные области независимо от цвета/трекера; pipeline матчит их
+    # со своим трекером и отвергает «застывшие» треки перезахватом по потоку.
+    use_flow_detector: bool = os.getenv("BT_USE_FLOW", "1") == "1"
+    flow_skip_frames: int = int(os.getenv("BT_FLOW_SKIP", "2"))   # искать каждые N кадров
+    flow_min_area_frac: float = float(os.getenv("BT_FLOW_MIN_AREA_FRAC", "0.00004"))
+    flow_max_area_frac: float = float(os.getenv("BT_FLOW_MAX_AREA_FRAC", "0.004"))
+    flow_min_mag: float = float(os.getenv("BT_FLOW_MIN_MAG", "1.2"))  # мин. скорость потока внутри blob
+    # если трек «застыл» (почти не двигается) N подряд кадров, а рядом есть
+    # движущийся поток-кандидат — перезахват трека по потоку
+    flow_relock_stall_frames: int = int(os.getenv("BT_FLOW_RELOCK_STALL", "3"))
     # Мяч отслеживается ТОЛЬКО во время полёта (pas-by-pass), а не весь ролик:
     # сегмент регистрируется как пас, только если перед ним зафиксирован
     # контакт с игроком (release). НО: на реальных видео COCO-детектор людей
