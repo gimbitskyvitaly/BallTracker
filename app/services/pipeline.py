@@ -79,6 +79,47 @@ def _inside(pt: tuple[float, float], rect) -> bool:
     return rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]
 
 
+def _drop_outliers(xs: np.ndarray, ys: np.ndarray, tol: float):
+    """Отбрасывание ложных точек трека по правилу «соседей».
+
+    Точка i считается выбросом (на ней трекер ложно захватил не мяч), если
+    она сильно отличается от соседа i-1, при этом сам сосед i-1 находится
+    рядом со следующим «выжившим» кандидатом i+1:
+        d(i, i-1) > tol   и   d(i-1, i+1) <= tol.
+    Выброс просто удаляется из траектории — он не участвует ни в сглаживании,
+    ни в физическом фитте, ни в метриках классификатора. Обход однок passes
+    слева направо; после удаления точка i-1 становится «якорем», поэтому
+    серия из нескольких ложных подряд точек тоже схлопывается (каждая
+    следующая сравнивается уже с якорем).
+
+    Возвращает (xs_kept, ys_kept, keep_mask).
+    """
+    n = len(xs)
+    keep = np.ones(n, dtype=bool)
+    if n < 3:
+        return xs, ys, keep
+    anchor = 0                       # индекс последней принятой точки
+    for i in range(1, n - 1):
+        d_prev = math.hypot(float(xs[i]) - float(xs[anchor]),
+                            float(ys[i]) - float(ys[anchor]))
+        if d_prev <= tol:
+            anchor = i               # обычная непрерывная точка
+            continue
+        # точка далеко от предыдущей — смотрим, вернулся ли трек к соседу:
+        # если i+1 близко к anchor-предку (i-1 в момент проверки == anchor),
+        # значит i — одиночный фантом, выкидываем её, anchor НЕ двигаем
+        d_next = math.hypot(float(xs[i + 1]) - float(xs[anchor]),
+                            float(ys[i + 1]) - float(ys[anchor]))
+        if d_next <= tol:
+            keep[i] = False
+        else:
+            # оба окрестности далеко — скорее всего это реальный резкий
+            # перелёт/срыв трека надолго: принимаем точку как новую опору,
+            # иначе один промах «съест» весь остаток сегмента
+            anchor = i
+    return xs[keep], ys[keep], keep
+
+
 def _median_filter(a: np.ndarray, k: int = 5) -> np.ndarray:
     """Медианное сглаживание ряда (окно k, границы — отражением).
 
@@ -98,8 +139,13 @@ def _median_filter(a: np.ndarray, k: int = 5) -> np.ndarray:
 
 def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
              catcher: Detection | None, width: int, height: int,
-             fps: float) -> bool:
+             fps: float) -> bool | tuple[bool, list[int]]:
     """Классификация сегмента полёта: пас или подача/приём/атака.
+
+    Возвращает False (не пас) либо пару (True, kept_idx) — список индексов
+    точек pts, которые НЕ являются ложными выбросами («правило соседей»,
+    см. _drop_outliers). kept_idx используется далее, чтобы в траектории и
+    физике участвовал только чистый параболический полёт без фантомов.
 
     Пас = мяч ОТЛЕТЕЛ ОТ ИГРОКА и пролетел выражено по параболе влево или
     вправо к ДРУГОМУ игроку. Признаки (эвристики в духе готовых решений —
@@ -120,13 +166,66 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
         return False
     xs = np.array([p[1] for p in pts], dtype=float)
     ys = np.array([p[2] for p in pts], dtype=float)
-    # --- медианное сглаживание ---------------------------------------------
-    # Реальные треки зашумлены (Kalman + срывы CSRT на фон): одиночный
-    # ложный «выброс» на сотни пикселей раньше либо раздувал dx (фантомы),
-    # либо, наоборот, ломал окна скорости/вершины. Медианное окно подавляет
-    # выбросы, не срезая реальную дугу.
-    xs = _median_filter(xs, 5)
-    ys = _median_filter(ys, 5)
+    # --- отбрасывание ложных точек («правило соседей») ------------------------
+    # Точка i — выброс, если она далеко от i-1, а i-1 рядом с i+1: трекер на
+    # кадре i схватил не мяч (фон/игрок). Такие точки УДАЛЯЮТСЯ из сегмента до
+    # всех метрик — иначе один фантом раздувает dx, роняет вершину дуги и
+    # делает траекторию неестественной (см. баг «траектория не параболическая,
+    # соседние точки сильно отличаются»).
+    tol = settings.outlier_tol_px if settings.outlier_tol_px > 0 \
+        else max(30.0, 0.05 * width)
+    # Множественный проход: после удаления одиночных фантомов остаются
+    # «ступеньки» A,A,...,A,B,B,...,B (трекер залип на ложной области
+    # несколько кадров подряд). На следующем проходе серия B целиком
+    # оказывается далеко от якоря A и удаляется — прогоняем, пока есть
+    # удаления. Индексы pts пересчитываются через карту выживших.
+    alive = list(range(len(pts)))
+    xs_cur, ys_cur = xs, ys
+    for _ in range(12):
+        xk, yk, keep = _drop_outliers(xs_cur, ys_cur, tol)
+        if bool(keep.all()):
+            break
+        surv = [alive[i] for i, k in enumerate(keep) if k]
+        # если удалено больше половины — это не точечный шум, а реальный
+        # разрыв трека: останавливаемся, иначе потеряем весь сегмент
+        if len(surv) < max(settings.min_flight_frames, 0.5 * len(alive)):
+            break
+        alive, xs_cur, ys_cur = surv, xk, yk
+    kept_idx = alive
+    xs_f, ys_f = xs_cur, ys_cur
+    if len(xs_f) < settings.min_flight_frames:
+        return False
+    frames_k = [pts[i][0] for i in kept_idx]
+    # --- физическая проверка непрерывности -----------------------------------
+    # После удаления выбросов между КАЖДЫМИ двумя сохранёнными соседями шаг
+    # не должен превышать допустимый: мяч в полёте за кадр (1/fps) не может
+    # переместиться дальше, чем на n_sigma сигм свободного падения + типичная
+    # скорость. Это отсекает «ступеньки» залипания трекера (напр. прыжок
+    # 925,399 -> 1039,64 на одном кадре: по вертикали за 33 мс мяч проходит
+    # максимум ~50-80 px при любой разумной начальной скорости паса).
+    # Если таких разрывов много или они «съедают» сегмент — событие не пас.
+    dt_min = min((frames_k[j + 1] - frames_k[j]) for j in range(len(frames_k) - 1)) \
+        if len(frames_k) > 1 else 1
+    dt_s = max(dt_min / max(fps, 1e-6), 1e-3)
+    v_typ = settings.max_step_speed_px_s          # типичная макс. скорость мяча, px/s
+    g_px = settings.gravity_ratio * fps * fps     # ускорение, px/s^2 (как в physics)
+    max_step = v_typ * dt_s + 0.5 * g_px * dt_s * dt_s * settings.max_step_sigma
+    big_gaps = 0
+    for j in range(len(xs_f) - 1):
+        step = math.hypot(float(xs_f[j + 1]) - float(xs_f[j]),
+                          float(ys_f[j + 1]) - float(ys_f[j]))
+        if step > max_step:
+            big_gaps += 1
+    if big_gaps and (big_gaps >= settings.max_step_gaps_allowed
+                     or big_gaps > 0.1 * len(xs_f)):
+        return False
+    # --- медианное сглаживание ----------------------------------------------
+    # Реальные треки зашумлены (Kalman + срывы CSRT на фон): остаточный шум
+    # подавляется медианным окном, которое уже не содержит выкинутых фантомов
+    # и потому не «тянет» ряд к ложным координатам.
+    xs = _median_filter(xs_f, 5)
+    ys = _median_filter(ys_f, 5)
+    n = len(xs)
     span = abs(xs[-1] - xs[0])
     # максимальный горизонтальный пролёт внутри сегмента (устойчив к шуму
     # последних точек Kalman-сглаживания)
@@ -140,11 +239,11 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
     # мяч ещё в доигровой фазе), и реальные быстрые пасы отсеивались как
     # «медленные». Щадящий режим: считаем полёт быстрым, если он был быстрым
     # ХОТЬ НА УЧАСТКЕ; медленный приём/доведение таких участков не имеют.
-    n = len(pts)
+    # Скорость считается по СОХРАНЁННЫМ точкам (dt — реальный кадр).
     k = min(3, n - 1)
     v_max = 0.0
     for i0 in range(n - k):
-        dt = max(pts[i0 + k][0] - pts[i0][0], 1)
+        dt = max(frames_k[i0 + k] - frames_k[i0], 1)
         v = math.hypot(xs[i0 + k] - xs[i0], ys[i0 + k] - ys[i0]) / dt
         v_max = max(v_max, v)
     if v_max < settings.pass_min_speed_px_f:
@@ -171,7 +270,7 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
         # теперь требуем достаточно длинный горизонтальный пролёт
         # (pass_no_catch_min_dx_frac), чтобы короткие отскоки/шум трека
         # не плодили фантомные события.
-        return dx >= settings.pass_no_catch_min_dx_frac * width
+        return (True, kept_idx) if dx >= settings.pass_no_catch_min_dx_frac * width else False
     if passer is not None:
         same_center = math.hypot(passer.center[0] - catcher.center[0],
                                  passer.center[1] - catcher.center[1]) \
@@ -180,8 +279,8 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
                                                                    passer.bbox)
         if same_center or overlap:
             # «туда-обратно» к тому же игроку: подброс/доведение — не пас
-            return not settings.pass_reject_self_return
-    return True
+            return (True, kept_idx) if not settings.pass_reject_self_return else False
+    return True, kept_idx
 
 
 def analyze_video(path: str, detector: BallDetector | None = None,
@@ -508,13 +607,25 @@ def _finalize_segment(analysis: VideoAnalysis, pts, passer: Detection | None,
                       catcher: Detection | None, passer_id, catcher_id,
                       fps: float, width: int, height: int) -> None:
     """Завершение сегмента полёта: классификация (пас / подача / приём /
-    атака) и, если это пас — оценка физики и регистрация события."""
+    атака) и, если это пас — оценка физики и регистрация события.
+
+    Ложные точки (выбросы «правила соседей») исключаются из pts до физики и
+    траектории: событие содержит только чистую параболическую дугу."""
     try:
-        if not _is_pass(pts, passer, catcher, width, height, fps):
-            return
+        verdict = _is_pass(pts, passer, catcher, width, height, fps)
     except Exception:  # noqa: BLE001 — классификатор не должен валить анализ
         return
-    _finalize_pass(analysis, pts, passer, catcher, fps,
+    if isinstance(verdict, tuple):
+        ok, kept_idx = verdict
+    else:
+        ok = bool(verdict)
+        kept_idx = list(range(len(pts)))
+    if not ok:
+        return
+    clean_pts = [pts[i] for i in kept_idx]
+    if len(clean_pts) < settings.min_flight_frames:
+        return
+    _finalize_pass(analysis, clean_pts, passer, catcher, fps,
                    ball_diam_sum_px(analysis), passer_id, catcher_id)
 
 
