@@ -1,6 +1,1 @@
-# Python compiled files
-__pycache__/
-*.pyc
-
-# Environment variables (common for Python projects, safe to include if not explicitly present but often needed)
-.env
+(empty)
