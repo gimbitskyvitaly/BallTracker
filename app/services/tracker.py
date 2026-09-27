@@ -229,6 +229,13 @@ class SORTTracker:
     def set_frame_size(self, width: int, height: int) -> None:
         self.frame_size = (width, height)
 
+    def reset_all(self) -> None:
+        """Полный сброс активных треков (используется pipeline при
+        перезахвате «застывшего» мяча по optical flow: старый трек-призрак
+        не должен продолжаться)."""
+        self.trackers = []
+        self._recently_dead = {}
+
     def _gate_cost(self, dets: np.ndarray, predicted_arr: np.ndarray) -> np.ndarray:
         """Стоимостная матрица: -IoU для допустимых пар, +inf для запрещённых.
 
