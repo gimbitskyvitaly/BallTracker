@@ -47,6 +47,52 @@ def _point_at_time(pts: list[tuple[int, float, float]], frame: float):
     return (pts[-1][1], pts[-1][2])
 
 
+def _parabolic_arc(seg, grid, width, height):
+    """Параболическая дуга для рендера: [(frame,x,y)] -> та же кривая,
+    разложенная покадрово. None — если фит не применим (тогда как было)."""
+    try:
+        from app.services.parabola import parabolicize
+        pts = [{"t": float(i), "x_px": x, "y_px": y}
+               for i, (_, x, y) in enumerate(seg)]
+        out = parabolicize(pts, grid=grid, width=width, height=height)
+        if out is pts or len(out) < 3:
+            return None
+        # проверка «чистоты»: все точки фита на одной параболе?
+        xs = np.array([p["x_px"] for p in out], dtype=float)
+        ys = np.array([p["y_px"] for p in out], dtype=float)
+        coef = np.polyfit(xs, ys, 2)
+        dev = np.abs(np.polyval(coef, xs) - ys).max()
+        if dev > 6.0:
+            return None
+        # разложить параболу по кадрам исходного сегмента: t кадра -> доля
+        # пути по длине дуги (монотонно), концы сегмента сохраняются
+        lens = [0.0]
+        for i in range(1, len(out)):
+            lens.append(lens[-1] + math.hypot(out[i]["x_px"] - out[i - 1]["x_px"],
+                                              out[i]["y_px"] - out[i - 1]["y_px"]))
+        total = max(lens[-1], 1e-9)
+        res = []
+        for f, x0, y0 in seg:
+            frac = (f - seg[0][0]) / max(seg[-1][0] - seg[0][0], 1e-9)
+            target = frac * total
+            j = next((k for k in range(len(lens)) if lens[k] >= target),
+                     len(lens) - 1)
+            if j == 0:
+                px, py = out[0]["x_px"], out[0]["y_px"]
+            else:
+                s0, s1 = lens[j - 1], lens[j]
+                u = (target - s0) / max(s1 - s0, 1e-9)
+                px = out[j - 1]["x_px"] + (out[j]["x_px"] - out[j - 1]["x_px"]) * u
+                py = out[j - 1]["y_px"] + (out[j]["y_px"] - out[j - 1]["y_px"]) * u
+            res.append((int(f), float(px), float(py)))
+        # первый/последний кадр — реальные позиции релиза/приёмки
+        res[0] = (seg[0][0], seg[0][1], seg[0][2])
+        res[-1] = (seg[-1][0], seg[-1][1], seg[-1][2])
+        return res
+    except Exception:  # noqa: BLE001 — рендер не должен валить job
+        return None
+
+
 class FlightOverlay:
     """Один полёт (пас) с подготовленными для рендера данными."""
 
@@ -195,6 +241,15 @@ def render_tracked_video(src_path: str, dst_path: str, analysis,
             "distance_m": p.flight.distance_m if p.flight else None,
             "initial_speed_mps": p.flight.initial_speed_mps if p.flight else None,
         }
+        # ТЗ-отрисовка: дуга паса рисуется ЧИСТОЙ ПАРАБОЛОЙ (тот же фит,
+        # что и в API trajectory) от пересечения одной ветви с линиями сетки
+        # до пересечения другой. Если траектория уже отфичена (все точки
+        # лежат на одной параболе) — её координаты используются как есть;
+        # иначе парабола fit'ится по сегменту здесь.
+        arc_pts = _parabolic_arc(seg, getattr(analysis, "grid_lines", None),
+                                 w, h)
+        if arc_pts is not None:
+            seg = arc_pts
         overlays.append(FlightOverlay(idx, p.release_frame, p.catch_frame,
                                       seg, metrics, sim_pts))
 
