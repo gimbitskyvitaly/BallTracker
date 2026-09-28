@@ -1,7 +1,10 @@
-# Compiled and build artifacts
+# Python compiled files
 __pycache__/
 *.pyc
 
-# Environment files
-.env
-.env.local
+# Logs
+server.log
+*.log
+
+# Temporary files
+tmp/

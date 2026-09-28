@@ -21,6 +21,7 @@ import numpy as np
 from app.config import settings
 from app.services.detector import BallDetector, Detection
 from app.services.tracker import SORTTracker
+from app.services.outliers import filter_flight_outliers
 from app.services.physics import estimate_flight, FlightEstimate, set_gravity_px
 
 
