@@ -1,1 +1,11 @@
-(empty)
+# Compiled and build artifacts
+__pycache__/
+*.pyc
+
+# Logs
+server.log
+*.log
+
+# Generated data/artifacts (based on specific paths in change list)
+data/renders/
+data/uploads/

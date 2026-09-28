@@ -40,6 +40,7 @@ import cv2
 import numpy as np
 
 from app.config import settings
+from app.services.cleanup import clean_point_dicts, clean_track_points
 from app.services.detector import BallDetector, Detection
 from app.services.tracker import SORTTracker
 from app.services.physics import estimate_flight, FlightEstimate, set_gravity_px
@@ -501,6 +502,10 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     if ball_diam_n:
         analysis.ball_radius_px = max(4.0, ball_diam_sum / ball_diam_n / 2.0)
     analysis.n_frames = frame_id
+    # ПОСТОБРАБОТКА полного трека (для рендера/API): одиночные ложные захваты
+    # заменяются интерполяцией; длина/кадры не меняются, при сомнении — как было.
+    analysis.ball_track_points = clean_track_points(
+        analysis.ball_track_points, width, height, fps)
     return analysis
 
 
@@ -582,9 +587,26 @@ def _finalize_pass(analysis: VideoAnalysis, pts, passer: Detection | None,
                    ball_diam_px: float, passer_id=None, catcher_id=None) -> None:
     if len(pts) < settings.min_flight_frames:
         return
+    # --- ПОСТОБРАБОТКА: чистка точек-выбросов (ложные захваты трекера) -----
+    # Все точки сегмента уже известны — по критерию «i далеко от i-1, а i-1
+    # рядом с i+1» (локальный медианный масштаб шага) помеченные кадры
+    # заменяются интерполяцией между уцелевшими соседями. Длина сегмента и
+    # тайминги (release/catch/ToF) НЕ меняются, мяч продолжает детектиться;
+    # физический фит перестаёт «тянуться» за фантомными точками и траектория
+    # становится параболической. При любом сомнении — исходные точки.
+    dicts = [{"f": int(f), "x": float(x), "y": float(y)} for f, x, y in pts]
+    cleaned = clean_point_dicts(dicts, coord_keys=("x", "y"), time_key="f")
+    pts = [(p["f"], p["x"], p["y"]) for p in cleaned]
     flight = estimate_flight(pts, fps, ball_diam_px,
                              settings.drag_coefficient,
                              use_physics=settings.use_physics_fit)
+    # выбросы убираем и из выходной trajectory (на случай tracked_direct:
+    # там точки = наблюдения 1-в-1). Чистка идемпотентна: на уже гладком
+    # ряду ничего не меняется (проверено регрессионными тестами).
+    if flight is not None and len(flight.trajectory) >= 6:
+        flight.trajectory = clean_point_dicts(flight.trajectory,
+                                              coord_keys=("x_px", "y_px"),
+                                              time_key="t")
     ev = PassEvent(
         release_frame=int(pts[0][0]),
         catch_frame=int(pts[-1][0]),
