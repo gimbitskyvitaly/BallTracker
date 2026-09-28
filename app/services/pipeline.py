@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 
 import cv2
@@ -42,6 +43,7 @@ import numpy as np
 from app.config import settings
 from app.services.cleanup import clean_point_dicts, clean_track_points
 from app.services.detector import BallDetector, Detection
+from app.services.parabola import detect_grid_lines, parabolicize
 from app.services.tracker import SORTTracker
 from app.services.physics import estimate_flight, FlightEstimate, set_gravity_px
 
@@ -66,6 +68,8 @@ class VideoAnalysis:
     ball_track_points: list[dict] = field(default_factory=list)  # [{frame,x,y}]
     passes: list[PassEvent] = field(default_factory=list)
     ball_radius_px: float = 6.0
+    # линии сетки кадра (xs, ys) — для рендера дуги «от сетки до сетки»
+    grid_lines: tuple[list[float], list[float]] | None = None
 
 
 def _expanded(box: np.ndarray, scale: float) -> tuple[float, float, float, float]:
@@ -188,6 +192,31 @@ def _is_pass(pts: list[tuple[int, float, float]], passer: Detection | None,
 def analyze_video(path: str, detector: BallDetector | None = None,
                   max_frames: int | None = None,
                   progress_cb=None) -> VideoAnalysis:
+    """Двухпроходный анализ (ТЗ-постобработка параболическим фитом).
+
+    Проход 1 собирает сырой трек мяча и кадры для детекции ЛИНИЙ СЕТКИ;
+    по ним определяются границы фита «от пересечения одной ветви параболы
+    с сеткой до пересечения другой». Проход 2 повторяет детекцию (детектор
+    сброшен — результат детерминированно совпадает с проходом 1) уже С
+    известной сеткой, и каждая траектория паса заменяется параболой, fit'ен-
+    ной по её чистому параболическому участку. При неудаче любой точки
+    очистка отдаёт исходный список — сервис не ломается, мяч детектится.
+    """
+    pre = _analyze_pass(path, detector=detector, max_frames=max_frames,
+                        progress_cb=None, grid=None)
+    grid = getattr(pre, "grid_lines", None)
+    if grid is None:
+        grid = ([pre.width * i / 8.0 for i in range(1, 8)],
+                [pre.height * i / 4.0 for i in range(1, 4)])
+    return _analyze_pass(path, detector=detector, max_frames=max_frames,
+                         progress_cb=progress_cb, grid=grid)
+
+
+def _analyze_pass(path: str, detector: BallDetector | None = None,
+                  max_frames: int | None = None,
+                  progress_cb=None,
+                  grid: tuple[list[float], list[float]] | None = None
+                  ) -> VideoAnalysis:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise ValueError(f"Не удалось открыть видео: {path}")
@@ -225,6 +254,11 @@ def analyze_video(path: str, detector: BallDetector | None = None,
 
     analysis = VideoAnalysis(fps=fps, width=width, height=height, n_frames=0)
     flow_ball = RobustFlowBall(width, height) if settings.use_flow_detector else None
+    # Кадры для детекции ЛИНИЙ СЕТКИ (постобработка-фит parabola.py): берём
+    # равномерно ~12 кадров со всего видео, даунскейл x3 — линии от этого не
+    # теряются, а стоимость пренебрежима.
+    grid_frames: list[np.ndarray] = []
+    grid_step = max(1, total // 12 if total > 0 else 45)
 
     prev_ball: tuple[float, float] | None = None
     contact_person: Detection | None = None      # игрок, державший мяч
@@ -244,6 +278,13 @@ def analyze_video(path: str, detector: BallDetector | None = None,
         if not ok:
             break
         frame_id += 1
+        if frame_id % grid_step == 0 and len(grid_frames) < 16:
+            try:
+                small = cv2.resize(frame, (frame.shape[1] // 3,
+                                           frame.shape[0] // 3))
+                grid_frames.append(small)
+            except Exception:  # noqa: BLE001 — детекция сетки не должна валить анализ
+                pass
         balls, persons = det.detect(frame)
 
         # --- Robust Flow: независимые кандидаты «движущегося мяча» ----------
@@ -437,7 +478,8 @@ def analyze_video(path: str, detector: BallDetector | None = None,
                 contact_streak = 0
                 if flight_pts:
                     _finalize_segment(analysis, flight_pts, contact_person, None,
-                                      contact_pid, None, fps, width, height)
+                                      contact_pid, None, fps, width, height,
+                                      grid=grid)
                     flight_pts = []
         else:
             no_person_frames = 0
@@ -448,7 +490,7 @@ def analyze_video(path: str, detector: BallDetector | None = None,
                 # классификатор _is_pass)
                 _finalize_segment(analysis, flight_pts, contact_person,
                                   nearest_person, contact_pid, nearest_pid,
-                                  fps, width, height)
+                                  fps, width, height, grid=grid)
                 flight_pts = []
             # фиксируем владение: новый контакт всегда принадлежит текущему
             # ближайшему игроку (если серия идёт у того же — ничего не меняется)
@@ -472,7 +514,8 @@ def analyze_video(path: str, detector: BallDetector | None = None,
             # защита от «вечного» полёта без приёмки
             if flight_pts and frame_id - flight_pts[-1][0] > settings.max_age:
                 _finalize_segment(analysis, flight_pts, contact_person, None,
-                                  contact_pid, None, fps, width, height)
+                                  contact_pid, None, fps, width, height,
+                                  grid=grid)
                 flight_pts = []
                 contact_person = None
                 contact_pid = None
@@ -497,11 +540,15 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     # незавершённый полёт в конце видео
     if flight_pts:
         _finalize_segment(analysis, flight_pts, contact_person, None,
-                          contact_pid, None, fps, width, height)
+                          contact_pid, None, fps, width, height, grid=grid)
     cap.release()
     if ball_diam_n:
         analysis.ball_radius_px = max(4.0, ball_diam_sum / ball_diam_n / 2.0)
     analysis.n_frames = frame_id
+    try:
+        analysis.grid_lines = detect_grid_lines(grid_frames, width, height)
+    except Exception:  # noqa: BLE001 — без сетки фит использует равномерную
+        analysis.grid_lines = None
     # ПОСТОБРАБОТКА полного трека (для рендера/API): одиночные ложные захваты
     # заменяются интерполяцией; длина/кадры не меняются, при сомнении — как было.
     analysis.ball_track_points = clean_track_points(
@@ -511,7 +558,8 @@ def analyze_video(path: str, detector: BallDetector | None = None,
 
 def _finalize_segment(analysis: VideoAnalysis, pts, passer: Detection | None,
                       catcher: Detection | None, passer_id, catcher_id,
-                      fps: float, width: int, height: int) -> None:
+                      fps: float, width: int, height: int,
+                      grid=None) -> None:
     """Завершение сегмента полёта: классификация (пас / подача / приём /
     атака) и, если это пас — оценка физики и регистрация события."""
     try:
@@ -520,7 +568,8 @@ def _finalize_segment(analysis: VideoAnalysis, pts, passer: Detection | None,
     except Exception:  # noqa: BLE001 — классификатор не должен валить анализ
         return
     _finalize_pass(analysis, pts, passer, catcher, fps,
-                   ball_diam_sum_px(analysis), passer_id, catcher_id)
+                   ball_diam_sum_px(analysis), passer_id, catcher_id,
+                   grid=grid, width=width, height=height)
 
 
 def ball_diam_sum_px(analysis: VideoAnalysis) -> float:
@@ -584,7 +633,8 @@ class RobustFlowBall:
 
 def _finalize_pass(analysis: VideoAnalysis, pts, passer: Detection | None,
                    catcher: Detection | None, fps: float,
-                   ball_diam_px: float, passer_id=None, catcher_id=None) -> None:
+                   ball_diam_px: float, passer_id=None, catcher_id=None,
+                   grid=None, width: int = 1920, height: int = 1080) -> None:
     if len(pts) < settings.min_flight_frames:
         return
     # --- ПОСТОБРАБОТКА: чистка точек-выбросов (ложные захваты трекера) -----
@@ -600,13 +650,16 @@ def _finalize_pass(analysis: VideoAnalysis, pts, passer: Detection | None,
     flight = estimate_flight(pts, fps, ball_diam_px,
                              settings.drag_coefficient,
                              use_physics=settings.use_physics_fit)
-    # выбросы убираем и из выходной trajectory (на случай tracked_direct:
-    # там точки = наблюдения 1-в-1). Чистка идемпотентна: на уже гладком
-    # ряду ничего не меняется (проверено регрессионными тестами).
-    if flight is not None and len(flight.trajectory) >= 6:
-        flight.trajectory = clean_point_dicts(flight.trajectory,
-                                              coord_keys=("x_px", "y_px"),
-                                              time_key="t")
+    # ФИНАЛЬНАЯ ПОСТОБРАБОТКА ВЫХОДНОЙ ТРАЕКТОРИИ (ТЗ): в траектории этого
+    # паса (один цвет на рендере) находится участок параболической формы,
+    # по нему МНК fit'ится парабола и вся дуга отрисовывается ею от
+    # пересечения одной ветви с линиями сетки до пересечения другой ветви.
+    # Ложные захваты (выбросы/хвосты фантомов) в итоговую кривую не попадают
+    # в принципе; релиз/приёмка остаются на своих местах; при неудаче —
+    # исходный список (мяч продолжает детектиться, список не пустеет).
+    if flight is not None and len(flight.trajectory) >= 8:
+        flight.trajectory = parabolicize(flight.trajectory, grid=grid,
+                                         width=width, height=height)
     ev = PassEvent(
         release_frame=int(pts[0][0]),
         catch_frame=int(pts[-1][0]),
