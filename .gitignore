@@ -1,6 +1,6 @@
-# Python compiled files
+# Compiled and build artifacts
 __pycache__/
 *.pyc
 
-# Environment variables
+# Environment
 .env
