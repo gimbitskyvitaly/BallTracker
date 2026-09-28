@@ -1,0 +1,15 @@
+OpenBLAS WARNING - could not determine the L2 cache size on this system, assuming 256k
+OpenBLAS WARNING - could not determine the L2 cache size on this system, assuming 256k
+OpenBLAS WARNING - could not determine the L2 cache size on this system, assuming 256k
+INFO:     Started server process [1041]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:39788 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39790 - "POST /api/v1/videos HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39794 - "GET /api/v1/jobs/bcf193a3ef99 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39800 - "GET /api/v1/jobs/bcf193a3ef99 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39802 - "GET /api/v1/passes/bcf193a3ef99 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39808 - "GET /api/v1/jobs/bcf193a3ef99 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39810 - "GET /api/v1/passes/bcf193a3ef99 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39814 - "GET /api/v1/passes/bcf193a3ef99 HTTP/1.1" 200 OK

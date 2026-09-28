@@ -1,10 +1,1 @@
-# Python compiled files
 __pycache__/
-*.pyc
-
-# Logs
-server.log
-*.log
-
-# Temporary files
-tmp/
