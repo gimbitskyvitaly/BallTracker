@@ -99,6 +99,24 @@ class Settings:
     drag_coefficient: float = 0.02     # безразмерный коэффициент сопротивления воздуха
     use_physics_fit: bool = True       # подгонять баллистическую модель к трек-данным
 
+    # --- VballNet (детекция мяча) + детекция пасов по траектории --------------
+    # Модель из https://github.com/asigatchov/fast-volleyball-tracking-inference
+    vballnet_path: str = os.getenv("BT_VBALLNET_PATH", "models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx")
+    heatmap_threshold: float = float(os.getenv("BT_HEATMAP_THRESHOLD", "0.5"))
+    # Розыгрыш: разрыв видимости мяча больше этого числа кадров закрывает эпизод.
+    rally_gap_frames: int = int(os.getenv("BT_RALLY_GAP", "15"))
+    # Параболические участки (свободный полёт): окно фита и допуски.
+    par_min_frames: int = int(os.getenv("BT_PAR_MIN_FRAMES", "6"))
+    par_max_frames: int = int(os.getenv("BT_PAR_MAX_FRAMES", "45"))
+    par_max_rmse_frac: float = float(os.getenv("BT_PAR_RMSE_FRAC", "0.03"))
+    # Эмпирическое гравитационное ускорение в px/s^2 = ratio * fps^2
+    # (подбирается под ракурс/масштаб съёмки; 0.55 — типовой зал).
+    gravity_fit_ratio: float = float(os.getenv("BT_GRAVITY_FIT_RATIO", "0.55"))
+    grav_tol_rel: float = float(os.getenv("BT_GRAV_TOL_REL", "0.75"))
+    # Минимальное горизонтальное перемещение участка (доля ширины кадра),
+    # отличающее настоящий перелёт «к сетке» от дребезга/ведения мяча.
+    min_horizontal_disp_frac: float = float(os.getenv("BT_MIN_DISP_FRAC", "0.06"))
+
     # --- Отрисовка траекторий поверх видео -------------------------------------
     render_tracked_video: bool = os.getenv("BT_RENDER_VIDEO", "1") == "1"
     trail_length: int = int(os.getenv("BT_TRAIL_LENGTH", "25"))  # «хвост» за мячом, точек

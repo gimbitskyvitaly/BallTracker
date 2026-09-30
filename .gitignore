@@ -1,9 +1,14 @@
-# Python bytecode and cache
+# Python compiled files
 __pycache__/
 *.pyc
 
-# Model weights (large binary files)
-*.pt
-
-# Videos
-*.mp4
+# Environment and IDE
+.env
+.vscode/
+# Runtime artifacts
+data/renders/
+data/uploads/
+data/*.db
+.pytest_cache/
+__pycache__/
+*.pyc

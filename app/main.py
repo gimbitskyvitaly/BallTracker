@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import traceback
@@ -25,24 +26,18 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.services import storage
-from app.services.detector import BallDetector
-from app.services.pipeline import analyze_video
+from app.services.pipeline import (analyze_video, get_vballnet_detector,
+                                   load_analysis, save_analysis)
 from app.services.renderer import render_tracked_video
 
 app = FastAPI(title="BallTrack — pass trajectory & time-of-flight", version="1.0.0")
 
 _executor = ThreadPoolExecutor(max_workers=2)
-_detector: BallDetector | None = None
-_detector_lock = threading.Lock()
 
 
-def get_detector() -> BallDetector:
-    """Ленивый singleton: загрузка YOLO дорогая."""
-    global _detector
-    with _detector_lock:
-        if _detector is None:
-            _detector = BallDetector()
-    return _detector
+def get_detector():
+    """Ленивый singleton VballNet-детектора (загрузка ONNX дорогая)."""
+    return get_vballnet_detector()
 
 
 class JobOut(BaseModel):
@@ -75,7 +70,12 @@ def _render_for_job(jid: str, path: str, force: bool = False) -> str:
     dst_dir = os.path.join(settings.render_dir, jid)
     os.makedirs(dst_dir, exist_ok=True)
     dst = os.path.join(dst_dir, "tracked.mp4")
-    analysis = analyze_video(path, detector=get_detector())
+    apath = os.path.join(dst_dir, "analysis.pkl")
+    if os.path.exists(apath) and not force:
+        analysis = load_analysis(apath)      # без повторного прогона модели
+    else:
+        analysis = analyze_video(path, detector=get_detector())
+        save_analysis(analysis, apath)
     render_tracked_video(path, dst, analysis)
     storage.set_result_video(jid, dst)
     return dst
@@ -90,8 +90,14 @@ def _run_job(jid: str, path: str) -> None:
             d = {
                 "release_frame": p.release_frame,
                 "catch_frame": p.catch_frame,
-                "passer_bbox": p.passer_bbox,
-                "catcher_bbox": p.catcher_bbox,
+                "passer_bbox": None,
+                "catcher_bbox": None,
+                "direction": p.direction,
+                "rally_index": p.rally_index,
+                "to_net_ratio": p.to_net_ratio,
+                "rmse_px": p.rmse_px,
+                "points_px": [[int(f), round(x, 1), round(y, 1)]
+                              for f, x, y in p.points_px],
             }
             if p.flight:
                 d.update({
@@ -109,11 +115,20 @@ def _run_job(jid: str, path: str) -> None:
                           "initial_speed_mps": None, "peak_speed_mps": None})
             passes.append(d)
         storage.save_passes(jid, passes)
+        storage.set_analysis_meta(
+            jid, detection_rate=analysis.detection_rate,
+            n_rallies=len(analysis.rallies),
+            rallies=[{"index": i, "start_frame": r.start_frame,
+                      "end_frame": r.end_frame,
+                      "phases": [{"start": a, "end": b, "side": s}
+                                 for a, b, s in r.phases]}
+                     for i, r in enumerate(analysis.rallies)])
         # сразу формируем видео с отрисованными траекториями поверх исходного
         if settings.render_tracked_video:
             try:
                 rdir = os.path.join(settings.render_dir, jid)
                 os.makedirs(rdir, exist_ok=True)
+                save_analysis(analysis, os.path.join(rdir, "analysis.pkl"))
                 dst = os.path.join(rdir, "tracked.mp4")
                 render_tracked_video(path, dst, analysis)
                 storage.set_result_video(jid, dst)
@@ -122,6 +137,9 @@ def _run_job(jid: str, path: str) -> None:
         storage.set_status(jid, "done", meta={
             "fps": analysis.fps, "width": analysis.width,
             "height": analysis.height, "n_frames": analysis.n_frames})
+        print(f"[job {jid}] frames={analysis.n_frames} ball_detection_rate="
+              f"{analysis.detection_rate:.0%} rallies={len(analysis.rallies)} "
+              f"passes={len(analysis.passes)}")
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         storage.set_status(jid, "error", error=str(e))
@@ -193,6 +211,18 @@ def result_video(jid: str, refresh: bool = Query(False, description="перер�
     return FileResponse(dst, media_type="video/mp4", filename=f"{jid}_tracked.mp4")
 
 
+@app.get("/api/v1/jobs/{jid}/video")
+def job_video(jid: str):
+    """Отдать готовое видео с траекториями (без повторного рендера)."""
+    job = storage.get_job(jid)
+    if not job:
+        raise HTTPException(404, "job не найден")
+    p = job.get("result_video_path")
+    if not p or not os.path.exists(p):
+        raise HTTPException(409, "видео с траекториями ещё не сформировано")
+    return FileResponse(p, media_type="video/mp4", filename=f"{jid}_tracked.mp4")
+
+
 @app.post("/api/v1/jobs/{jid}/render")
 def render_now(jid: str):
     """Принудительно (пере)сформировать видео с траекториями и вернуть путь."""
@@ -207,7 +237,7 @@ def render_now(jid: str):
 
 @app.get("/api/v1/trajectories/{jid}")
 def trajectories(jid: str):
-    """Точки траекторий по каждому полёту + сырой трек мяча."""
+    """Точки траекторий по каждому пасу (px + метры физмодели)."""
     if not storage.get_job(jid):
         raise HTTPException(404, "job не найден")
     out = []
@@ -215,8 +245,22 @@ def trajectories(jid: str):
         out.append({
             "release_frame": p["release_frame"],
             "catch_frame": p["catch_frame"],
+            "direction": p.get("direction"),
+            "rally_index": p.get("rally_index"),
+            "to_net_ratio": p.get("to_net_ratio"),
+            "rmse_px": p.get("rmse_px"),
             "time_of_flight_s": p["time_of_flight_s"],
             "method": p["method"],
             "trajectory": p["trajectory"],
+            "points_px": p.get("points_px") or [],
         })
     return {"job_id": jid, "flights": out}
+
+
+@app.get("/api/v1/rallies/{jid}")
+def rallies(jid: str):
+    """Розыгрыши, найденные при анализе (кадровые границы и фазы по сторонам)."""
+    job = storage.get_job(jid)
+    if not job:
+        raise HTTPException(404, "job не найден")
+    return {"job_id": jid, "rallies": json.loads(job.get("rallies_json") or "[]")}

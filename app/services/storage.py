@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     fps REAL, width INTEGER, height INTEGER, n_frames INTEGER,
     error TEXT,
     created_at TEXT, finished_at TEXT,
-    result_video_path TEXT          -- видео с отрисованными траекториями
+    result_video_path TEXT,         -- видео с отрисованными траекториями
+    detection_rate REAL,            -- доля кадров с детекцией мяча (VballNet)
+    n_rallies INTEGER,              -- число найденных розыгрышей
+    rallies_json TEXT               -- [{start_frame,end_frame,phases:[...]}, ...]
 );
 CREATE TABLE IF NOT EXISTS passes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,7 +30,12 @@ CREATE TABLE IF NOT EXISTS passes (
     time_of_flight_s REAL, apex_height_m REAL, distance_m REAL,
     initial_speed_mps REAL, peak_speed_mps REAL,
     method TEXT, passer_bbox TEXT, catcher_bbox TEXT,
-    trajectory_json TEXT
+    trajectory_json TEXT,
+    points_json TEXT,             -- трек мяча в px внутри паса: [[frame,x,y],...]
+    direction TEXT,               -- "left" | "right": полёт к сетке слева/справа
+    rally_index INTEGER,          -- номер розыгрыша, в котором найден пас
+    to_net_ratio REAL,            -- финиш/старт расстояния до линии сетки
+    rmse_px REAL                  -- качество параболического фита
 );
 """
 
@@ -47,11 +55,32 @@ def init_db() -> None:
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)")}
         if "result_video_path" not in cols:
             c.execute("ALTER TABLE jobs ADD COLUMN result_video_path TEXT")
+        for name, typ in (("detection_rate", "REAL"), ("n_rallies", "INTEGER"),
+                          ("rallies_json", "TEXT")):
+            if name not in cols:
+                c.execute(f"ALTER TABLE jobs ADD COLUMN {name} {typ}")
+        pcols = {r[1] for r in c.execute("PRAGMA table_info(passes)")}
+        for name, typ in (("points_json", "TEXT"), ("direction", "TEXT"),
+                          ("rally_index", "INTEGER"),
+                          ("to_net_ratio", "REAL"), ("rmse_px", "REAL")):
+            if name not in pcols:
+                c.execute(f"ALTER TABLE passes ADD COLUMN {name} {typ}")
 
 
 def set_result_video(jid: str, path: str) -> None:
     with _conn() as c:
         c.execute("UPDATE jobs SET result_video_path=? WHERE id=?", (path, jid))
+
+
+def set_analysis_meta(jid: str, detection_rate: float | None = None,
+                      n_rallies: int | None = None,
+                      rallies: list[dict] | None = None) -> None:
+    """Метаданные качества анализа: видимость мяча, розыгрыши."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE jobs SET detection_rate=?, n_rallies=?, rallies_json=? WHERE id=?",
+            (detection_rate, n_rallies,
+             json.dumps(rallies or [], ensure_ascii=False), jid))
 
 
 def create_job(video_path: str) -> str:
@@ -85,12 +114,16 @@ def save_passes(jid: str, passes: list[dict]) -> None:
         c.executemany(
             """INSERT INTO passes (job_id, release_frame, catch_frame, time_of_flight_s,
                apex_height_m, distance_m, initial_speed_mps, peak_speed_mps, method,
-               passer_bbox, catcher_bbox, trajectory_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               passer_bbox, catcher_bbox, trajectory_json, points_json,
+               direction, rally_index, to_net_ratio, rmse_px)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [(jid, p["release_frame"], p["catch_frame"], p["time_of_flight_s"],
               p["apex_height_m"], p["distance_m"], p["initial_speed_mps"],
               p["peak_speed_mps"], p["method"], json.dumps(p.get("passer_bbox")),
-              json.dumps(p.get("catcher_bbox")), json.dumps(p.get("trajectory", [])))
+              json.dumps(p.get("catcher_bbox")), json.dumps(p.get("trajectory", [])),
+              json.dumps(p.get("points_px", [])),
+              p.get("direction"), p.get("rally_index"), p.get("to_net_ratio"),
+              p.get("rmse_px"))
              for p in passes])
 
 
@@ -113,6 +146,7 @@ def get_passes(jid: str) -> list[dict]:
     for r in rows:
         d = dict(r)
         d["trajectory"] = json.loads(d.pop("trajectory_json") or "[]")
+        d["points_px"] = json.loads(d.pop("points_json") or "[]")
         d["passer_bbox"] = json.loads(d["passer_bbox"] or "null")
         d["catcher_bbox"] = json.loads(d["catcher_bbox"] or "null")
         out.append(d)

@@ -1,36 +1,53 @@
-"""Пайплайн анализа видео: YOLO-детекция → SORT-трекинг → события паса → физика.
+"""Пайплайн анализа видео: VballNet-детекция мяча → траектория → розыгрыши → пасы.
 
-Логика детекции паса (по аналогии с BallTime™, где события привязываются
-к игрокам):
-  * RELEASE: мяч был «в контакте» с игроком (центр мяча внутри расширенного
-    бокса person) и в следующем кадре покинул зону с резким ростом скорости;
-  * CATCH: траектория мяча входит в расширенный бокс другого игрока или
-    скорость мяча падает почти до нуля рядом с игроком;
-  * между release и catch формируется сегмент полёта → оценка ToF через
-    fit физмодели (app.services.physics).
+Раньше здесь стоял COCO-YOLO (класс 32 "sports ball") + SORT + эвристика
+пасов по «контакту с боксом игрока». Проблемы, зафиксированные на реальных
+волейбольных видео:
+  * COCO-YOLO почти не детектит маленький/размытый мяч в зале → пустые
+    траектории («мяч детектится плохо, часто вообще не детектится»);
+  * «пас» определялся как полёт между контактами с людьми → любой удар/подача/
+    отбой выглядел пасом, а настоящий пас терялся при пропусках детекции
+    («пас не отличается от не паса»).
+
+Новая схема:
+  1. Детекция мяча — VballNet (ONNX, окно 9 полутоновых кадров, heatmap) из
+     https://github.com/asigatchov/fast-volleyball-tracking-inference
+     (~87% видимости мяча вместо ~0% у COCO-YOLO).
+  2. Трек строится прямо по точкам детекции: одиночные выпадения закрываются
+     линейной интерполяцией (разрыв <= rally_gap_frames), поэтому параболы
+     не рвутся на осколки.
+  3. Розыгрыши и пасы — app.services.pass_detector: внутри розыгрышей ищутся
+     параболические (баллистические) участки, летящие ВЛЕВО/ВПРАВО К сетке;
+     только они считаются пасами. Направление «от сетки» (атака/отбой) —
+     не пас.
+  4. Для каждого паса метрики (ToF, apex, дальность, v0) оцениваются физмо-
+     делью app.services.physics по точкам траектории участка.
 """
 
 from __future__ import annotations
 
-import math
+import pickle
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
 from app.config import settings
-from app.services.detector import BallDetector, Detection
-from app.services.tracker import SORTTracker
-from app.services.physics import estimate_flight, FlightEstimate, set_gravity_px
+from app.services.pass_detector import Rally, detect_passes
+from app.services.physics import estimate_flight, set_gravity_px
+from app.services.vballnet import VballNetDetector
 
 
 @dataclass
 class PassEvent:
     release_frame: int
     catch_frame: int
-    passer_bbox: list[float]
-    catcher_bbox: list[float] | None
-    flight: FlightEstimate | None = None
+    direction: str                      # "left" | "right" — к сетке слева/справа
+    to_net_ratio: float                 # финиш/старт расстояния до сетки (<1 = сблизился)
+    rmse_px: float
+    points_px: list[tuple[int, float, float]] = field(default_factory=list)
+    flight: object = None               # FlightEstimate | None
+    rally_index: int = -1
 
 
 @dataclass
@@ -39,23 +56,47 @@ class VideoAnalysis:
     width: int
     height: int
     n_frames: int
-    ball_track_points: list[dict] = field(default_factory=list)  # [{frame,x,y}]
+    ball_track_points: list[dict] = field(default_factory=list)   # [{frame,x,y}]
+    rallies: list[Rally] = field(default_factory=list)
     passes: list[PassEvent] = field(default_factory=list)
     ball_radius_px: float = 6.0
+    detection_rate: float = 0.0         # доля кадров с детекцией мяча
 
 
-def _expanded(box: np.ndarray, scale: float) -> tuple[float, float, float, float]:
-    x1, y1, x2, y2 = box
-    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-    r = math.hypot(x2 - x1, y2 - y1) * scale / 2
-    return cx - r, cy - r, cx + r, cy + r
+_detector_singleton: VballNetDetector | None = None
 
 
-def _inside(pt: tuple[float, float], rect) -> bool:
-    return rect[0] <= pt[0] <= rect[2] and rect[1] <= pt[1] <= rect[3]
+def get_vballnet_detector() -> VballNetDetector:
+    """Ленивый singleton: загрузка ONNX-сессии дорогая."""
+    global _detector_singleton
+    if _detector_singleton is None:
+        _detector_singleton = VballNetDetector(settings.vballnet_path,
+                                               threshold=settings.heatmap_threshold)
+    return _detector_singleton
 
 
-def analyze_video(path: str, detector: BallDetector | None = None,
+def _interp_track(raw: list[tuple[int, float, float]], gap_max: int
+                  ) -> list[tuple[int, float, float]]:
+    """Сырые детекции → плотный трек: разрывы <= gap_max закрываются интерполяцией.
+
+    Это замена SORT/Kalman: VballNet даёт стабильные точки, а интерполяция
+    убирает одиночные пропуски, не придумывая фантомных полётов (долгие
+    разрывы остаются границами розыгрышей)."""
+    if not raw:
+        return []
+    pts = sorted(raw, key=lambda p: p[0])
+    out = [pts[0]]
+    for (f0, x0, y0), (f1, x1, y1) in zip(pts, pts[1:]):
+        gap = f1 - f0
+        if 1 < gap <= gap_max:
+            for k in range(1, gap):
+                t = k / gap
+                out.append((f0 + k, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        out.append((f1, x1, y1))
+    return out
+
+
+def analyze_video(path: str, detector: VballNetDetector | None = None,
                   max_frames: int | None = None,
                   progress_cb=None) -> VideoAnalysis:
     cap = cv2.VideoCapture(path)
@@ -65,187 +106,97 @@ def analyze_video(path: str, detector: BallDetector | None = None,
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    det = detector or BallDetector()
-    tracker = SORTTracker()
-    tracker.set_frame_size(width, height)   # физический gate от срывов за кадр
-    set_gravity_px(fps, settings.gravity_ratio)   # только для fit'а метрик (px/s^2)
-    # Kalman-модель постоянного ускорения по вертикали: эмпирическое g в
-    # px/frame^2 (НЕ gravity_ratio*fps^2 — это размерность px/s^2 для фита;
-    # подстановка её в трекер разгоняла треки по вертикали — «catch на
-    # потолке», а при другом fps рвала полёт на осколки).
-    # Предел скорости трекера — из физического gate кадра.
-    v_max = settings.max_jump_frac * min(width, height)
-    tracker.set_physics(settings.kalman_gravity_px_f2, max_speed_px_per_f=v_max)
+    det = detector or get_vballnet_detector()
 
-    analysis = VideoAnalysis(fps=fps, width=width, height=height, n_frames=0)
+    # --- проход 1: детекция мяча окном VballNet ------------------------------
+    raw: list[tuple[int, float, float]] = []
+    frames_read = 0
+    detected = 0
+    chunk: list[np.ndarray] = []
+    CHUNK = 60  # батч кадров для скользящего 9-окна модели
 
-    prev_ball: tuple[float, float] | None = None
-    prev_persons: list[Detection] = []
-    contact_person: Detection | None = None      # игрок, державший мяч
-    flight_pts: list[tuple[int, float, float]] = []
-    ball_diam_sum, ball_diam_n = 0.0, 0
-    frame_id = 0
-    contact_streak = 0        # подряд идущие кадры «мяч в зоне игрока»
-    no_person_frames = 0      # подряд идущие кадры без людей в кадре
-
+    def _flush(chunk: list[np.ndarray], start_idx: int):
+        nonlocal detected
+        results = det.feed(chunk, start_idx=start_idx)
+        for r in results:
+            if r is not None:
+                raw.append((r.frame, r.x, r.y))
+    
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        frame_id += 1
-        balls, persons = det.detect(frame)
-
-        ball_det: Detection | None = balls[0] if balls else None
-        dets_arr = np.array([b.bbox for b in balls[:3]]) if balls else np.empty((0, 4))
-        tracks = tracker.update(dets_arr)
-        tvx = tvy = 0.0
-        center: tuple[float, float] | None = None
-        used_det: Detection | None = None
-        # выбор позиции мяча: трекера нет -> прямая детекция; иначе — Kalman-сглаживание
-        if ball_det is not None and tracks:
-            bx, by = ball_det.center
-            best = min(tracks, key=lambda t: math.hypot((t[1][0] + t[1][2]) / 2 - bx,
-                                                        (t[1][1] + t[1][3]) / 2 - by))
-            tb = best[1]
-            cx_t, cy_t = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
-            # физический gate на уровне пайплайна: если Kalman-предсказание
-            # уехало далеко от свежей детекции — это сорванный трек, не
-            # подмешиваем его (иначе траектория «тянется» за призраком).
-            jump = math.hypot(cx_t - bx, cy_t - by)
-            max_jump = settings.max_jump_frac * min(width, height)
-            if jump <= max_jump:
-                alpha = 0.65   # доверие Kalman-предсказанию при наличии свежей детекции
-                center = (alpha * cx_t + (1 - alpha) * bx, alpha * cy_t + (1 - alpha) * by)
-                tvx, tvy = best[2], best[3]
-            else:
-                center = (bx, by)     # доверяем только детекции
-            used_det = ball_det
-        elif ball_det is not None:
-            center = ball_det.center
-            used_det = ball_det
-        elif tracks:      # окклюзия: держимся за предсказание трекера
-            tb = tracks[0][1]
-            cx_t, cy_t = (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2
-            # то же ограничение на extrapolation: без наблюдений долго лететь
-            # по инерции нельзя (max_age мал, но и запасной контроль не помеха)
-            max_jump = settings.max_jump_frac * min(width, height) * settings.max_age
-            if prev_ball is not None and math.hypot(cx_t - prev_ball[0],
-                                                    cy_t - prev_ball[1]) > max_jump:
-                center = None
-            else:
-                center = (cx_t, cy_t)
-                tvx, tvy = tracks[0][2], tracks[0][3]
-            used_det = None               # диаметра не наблюдаем
-        else:
-            center = None
-
-        if center is not None:
-            prev_ball = center
-        else:
-            prev_ball = None
-
-        # --- состояние контакта с игроком -----------------------------------
-        nearest_person = None
-        if center and persons:
-            best_p, bestd = None, 1e18
-            for p in persons:
-                pcx, pcy = p.center
-                d = math.hypot(center[0] - pcx, center[1] - pcy)
-                if d < bestd:
-                    best_p, bestd = p, d
-            nearest_person = best_p
-
-        speed = math.hypot(tvx, tvy)
-
-        if center and nearest_person is not None:
-            rect = _expanded(nearest_person.bbox, settings.contact_expand)
-            touching = _inside(center, rect)
-        else:
-            touching = False
-
-        # владение засчитываем только после непрерывной серии контактов —
-        # защита от одиночных ложных срабатываний («мяч» рядом с игроком)
-        if touching:
-            contact_streak += 1
-        else:
-            contact_streak = 0
-        has_contact = contact_streak >= settings.contact_streak
-
-        # эпизод без людей вообще (повтор/тайм-аут/пустой кадр) — сброс состояния
-        if not persons:
-            no_person_frames += 1
-            if no_person_frames >= settings.no_person_reset:
-                contact_person = None
-                contact_streak = 0
-                if flight_pts:
-                    if len(flight_pts) >= settings.min_flight_frames:
-                        _finalize_pass(analysis, flight_pts, contact_person, None,
-                                       fps, ball_diam_sum / max(ball_diam_n, 1))
-                    flight_pts = []
-        else:
-            no_person_frames = 0
-
-        if has_contact:
-            if flight_pts:
-                # приёмка: полёт завершён
-                if len(flight_pts) >= settings.min_flight_frames:
-                    _finalize_pass(analysis, flight_pts, contact_person, nearest_person,
-                                   fps, ball_diam_sum / max(ball_diam_n, 1))
-                flight_pts = []
-            contact_person = nearest_person
-        elif center is not None:
-            if not flight_pts:
-                # релиз: БЫЛО подтверждённое владение и мяч улетел из зоны игрока.
-                # Без владения сегмент не начинаем — мяч отслеживается только
-                # во время пасов, а не на всём видео.
-                if contact_person is not None or not settings.require_release_contact:
-                    flight_pts.append((frame_id, center[0], center[1]))
-            else:
-                flight_pts.append((frame_id, center[0], center[1]))
-            # защита от «вечного» полёта без приёмки
-            if flight_pts and frame_id - flight_pts[-1][0] > settings.max_age:
-                _finalize_pass(analysis, flight_pts, contact_person, None, fps,
-                               ball_diam_sum / max(ball_diam_n, 1))
-                flight_pts = []
-                contact_person = None
-
-        if used_det is not None:
-            diag = used_det.diag
-            ball_diam_sum += min(diag, height * 0.5)
-            ball_diam_n += 1
-        if center is not None and flight_pts:
-            # В ball_track_points пишем ТОЛЬКО точки активного полёта (пасов):
-            # вне полёта мяч не отслеживаем ни в анализе, ни в рендере.
-            analysis.ball_track_points.append(
-                {"frame": frame_id, "x": round(center[0], 1), "y": round(center[1], 1)})
-        if progress_cb and frame_id % 25 == 0:
-            progress_cb(frame_id, total)
-        if max_frames and frame_id >= max_frames:
+        chunk.append(frame)
+        frames_read += 1
+        if len(chunk) >= CHUNK:
+            _flush(chunk, frames_read - len(chunk))
+            chunk = []
+        if max_frames and frames_read >= max_frames:
             break
-
-    # незавершённый полёт в конце видео
-    if flight_pts:
-        _finalize_pass(analysis, flight_pts, contact_person, None, fps,
-                       ball_diam_sum / max(ball_diam_n, 1))
+    if chunk:
+        _flush(chunk, frames_read - len(chunk))
     cap.release()
-    if ball_diam_n:
-        analysis.ball_radius_px = max(4.0, ball_diam_sum / ball_diam_n / 2.0)
+
+    frames_read = max(frames_read, 1)
+    detected = len(raw)
+
+    # --- проход 2: трек → розыгрыши → параболические пасы --------------------
+    track = _interp_track(raw, gap_max=settings.rally_gap_frames)
+    set_gravity_px(fps, settings.gravity_fit_ratio)  # размерность px/s^2 для фита
+    rallies, pass_segs = detect_passes(
+        track, fps, width, height,
+        rally_gap_frames=settings.rally_gap_frames,
+        par_min_frames=settings.par_min_frames,
+        par_max_frames=settings.par_max_frames,
+        par_max_rmse_frac=settings.par_max_rmse_frac,
+        gravity_px_s2=fps * fps * settings.gravity_fit_ratio,
+        grav_tol_rel=settings.grav_tol_rel,
+        min_flight_frames=settings.min_flight_frames,
+        min_horizontal_disp_frac=settings.min_horizontal_disp_frac,
+    )
+
+    analysis = VideoAnalysis(fps=fps, width=width, height=height,
+                             n_frames=frames_read)
+    analysis.detection_rate = round(detected / frames_read, 3)
+    analysis.ball_track_points = [{"frame": int(f), "x": round(x, 1), "y": round(y, 1)}
+                                  for f, x, y in track]
+    analysis.rallies = rallies
+
+    # оценка диаметра мяча по локальной плотности трека (медиана шага не годится —
+    # берём фиксированную разумную величину: heatmap-детектор даёт центр,
+    # диаметр ≈ 3.5% высоты кадра для волейбола на типовой съёмке)
+    ball_diam_px = max(8.0, height * 0.035)
+    analysis.ball_radius_px = ball_diam_px / 2.0
+
+    # привязка пасов к розыгрышам
+    def rally_of(fr: int) -> int:
+        for i, r in enumerate(rallies):
+            if r.start_frame <= fr <= r.end_frame:
+                return i
+        return -1
+
+    for ps in pass_segs:
+        pts = [(int(f), float(x), float(y)) for f, x, y in ps.segment.points]
+        flight = None
+        if settings.use_physics_fit and len(pts) >= 4:
+            flight = estimate_flight(pts, fps, ball_diam_px,
+                                     settings.drag_coefficient, use_physics=True)
+        analysis.passes.append(PassEvent(
+            release_frame=ps.release_frame, catch_frame=ps.catch_frame,
+            direction=ps.direction, to_net_ratio=round(ps.segment.to_net_ratio, 3),
+            rmse_px=round(ps.segment.rmse_px, 2), points_px=pts, flight=flight,
+            rally_index=rally_of(ps.release_frame)))
+    if progress_cb:
+        progress_cb(frames_read, total)
     return analysis
 
 
-def _finalize_pass(analysis: VideoAnalysis, pts, passer: Detection | None,
-                   catcher: Detection | None, fps: float,
-                   ball_diam_px: float) -> None:
-    if len(pts) < settings.min_flight_frames:
-        return
-    flight = estimate_flight(pts, fps, ball_diam_px,
-                             settings.drag_coefficient,
-                             use_physics=settings.use_physics_fit)
-    ev = PassEvent(
-        release_frame=int(pts[0][0]),
-        catch_frame=int(pts[-1][0]),
-        passer_bbox=passer.bbox.tolist() if passer else [0, 0, 0, 0],
-        catcher_bbox=catcher.bbox.tolist() if catcher else None,
-        flight=flight,
-    )
-    analysis.passes.append(ev)
+def save_analysis(analysis: "VideoAnalysis", path: str) -> None:
+    """Сериализация результата анализа (чтобы ререндер не гонял модель заново)."""
+    with open(path, "wb") as f:
+        pickle.dump(analysis, f)
+
+
+def load_analysis(path: str) -> "VideoAnalysis":
+    with open(path, "rb") as f:
+        return pickle.load(f)
