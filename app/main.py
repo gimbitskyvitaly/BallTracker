@@ -135,6 +135,27 @@ def _run_job(jid: str, path: str) -> None:
                       "phases": [{"start": a, "end": b, "side": s}
                                  for a, b, s in r.phases]}
                      for i, r in enumerate(analysis.rallies)])
+        # статистика фильтрации: ложные детекции и клип «только выше сетки»
+        try:
+            import sqlite3
+            with storage._conn() as c:
+                c.execute("ALTER TABLE jobs ADD COLUMN filter_stats_json TEXT")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
+        fs = json.dumps({
+            "outliers": {k: v for k, v in analysis.removed_outliers.items()
+                         if k != "points"},
+            "outlier_points": analysis.removed_outliers.get("points", [])[:50],
+            "net_level": (None if analysis.net_level is None else {
+                "y_px": round(analysis.net_level.y_px, 1),
+                "source": analysis.net_level.source,
+                "scale_px_per_m": round(analysis.net_level.scale_px_per_m, 1),
+                "net_height_m": analysis.net_level.net_height_m,
+                "notes": analysis.net_level.notes}),
+            "net_clip": analysis.net_clip_stats,
+        }, ensure_ascii=False)
+        with storage._conn() as c:
+            c.execute("UPDATE jobs SET filter_stats_json=? WHERE id=?", (fs, jid))
         # сразу формируем видео с отрисованными траекториями поверх исходного
         if settings.render_tracked_video:
             try:
@@ -327,3 +348,16 @@ def rallies(jid: str):
     if not job:
         raise HTTPException(404, "job не найден")
     return {"job_id": jid, "rallies": json.loads(job.get("rallies_json") or "[]")}
+
+
+@app.get("/api/v1/jobs/{jid}/filters")
+def filters_stats(jid: str):
+    """Статистика фильтрации трека: ложные детекции (BT_OUTLIER_*) и клип
+    «только выше сетки» (BT_NET_* / BT_ONLY_ABOVE_NET): eps в px, число и
+    координаты выброшенных точек, определённый уровень сетки (y_px, source
+    manual/auto или null — если сетка не найдена, лимит не применялся)."""
+    job = storage.get_job(jid)
+    if not job:
+        raise HTTPException(404, "job не найден")
+    return {"job_id": jid,
+            **(json.loads(job.get("filter_stats_json") or "{}"))}

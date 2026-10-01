@@ -36,6 +36,12 @@ from app.config import settings
 from app.services.pass_detector import (Rally, detect_passes,
                                          raw_fit_diagnostics)
 from app.services.physics import estimate_flight, set_gravity_px
+from app.services.trajectory_filter import (BallPoint, NetLevel,
+                                            auto_court_geometry,
+                                            clip_track_above_net,
+                                            default_outlier_eps,
+                                            estimate_net_level,
+                                            remove_outliers)
 from app.services.vballnet import VballNetDetector
 
 
@@ -62,6 +68,14 @@ class VideoAnalysis:
     passes: list[PassEvent] = field(default_factory=list)
     ball_radius_px: float = 6.0
     detection_rate: float = 0.0         # доля кадров с детекцией мяча
+    # статистика фильтрации ложных детекций (remove_outliers): eps, число
+    # выброшенных точек, сами точки (для отладки порогов BT_OUTLIER_*)
+    removed_outliers: dict = field(default_factory=dict)
+    # уровень верхней ленты сетки (243 см) и результат клипа «только выше
+    # сетки»; net=None → уровень не определён (сетки нет/плохо видна), лимит
+    # НЕ применялся
+    net_level: NetLevel | None = None
+    net_clip_stats: dict = field(default_factory=dict)
     # диагностика режима render_mode="full": баллистические LSQ-фитЫ БЕЗ
     # фильтров (rmse/gravity/disp) по каждому розыгрышу + границы розыгрышей;
     # None в обычном режиме "passes"
@@ -145,8 +159,51 @@ def analyze_video(path: str, detector: VballNetDetector | None = None,
     frames_read = max(frames_read, 1)
     detected = len(raw)
 
-    # --- проход 2: трек → розыгрыши → параболические пасы --------------------
-    track = _interp_track(raw, gap_max=settings.rally_gap_frames)
+    # --- проход 2: трек → фильтрация ложных детекций → клип выше сетки --------
+    # Порядок важен: сначала убираем изолированные выбросы heatmap-детекции
+    # (блики/текстуры «телепортируют» трек и рвут баллистические фиты), затем
+    # отбрасываем точки НИЖЕ верхней ленты сетки (243 см) — нас интересуют
+    # только части траекторий ВЫШЕ сетки. Оба шага — app.services.trajectory_filter;
+    # раньше функции были написаны, но в пайплайн не подключены (баг).
+    ball_diam_px = max(8.0, height * 0.035)   # диаметр ≈ 3.5% высоты кадра
+
+    track_all = _interp_track(raw, gap_max=settings.rally_gap_frames)
+
+    eps = settings.outlier_eps_px
+    if not eps or eps <= 0:                   # 0 → авто из config-множителей
+        eps = default_outlier_eps(fps, height,
+                                  max_speed_px_s=settings.outlier_eps_max_speed_px_s,
+                                  ball_diam_mult=settings.outlier_eps_ball_diam_mult,
+                                  ball_diam_px=ball_diam_px)
+    track, dropped = remove_outliers(track_all, eps)
+    # интерполяция разрывов ПОВТОРНО: remove_outliers вырывает точки-выбросы,
+    # на их месте остаются дыры (разрыв ровно в 1 кадр), из-за которых
+    # find_parabolic_segments отказывался брать окно (запрет diff > gap_break).
+    track = _interp_track(track, gap_max=settings.rally_gap_frames)
+
+    net: NetLevel | None = None
+    if settings.only_above_net:
+        # геометрию/масштаб оцениваем по ПОЛНОМУ треку (до клипа): нижняя
+        # огибающая y — это как раз точки «у земли», которые клип как раз и
+        # отсекает; после клипа масштаб оценить было бы невозможно.
+        geo = auto_court_geometry(
+            track_all, height,
+            ground_frac_lo=settings.net_auto_ground_lo_frac,
+            ground_frac_hi=settings.net_auto_ground_hi_frac,
+            player_height_frac=settings.net_auto_player_height_m)
+        net = estimate_net_level(height, width, geo,
+                                 net_height_m=settings.net_top_height_m,
+                                 manual_y_px=float(settings.net_top_px),
+                                 scale_min=settings.net_scale_min_px_per_m,
+                                 scale_max=settings.net_scale_max_px_per_m)
+    track, clip_stats = clip_track_above_net(track, net)
+    # финальная чистка: интерполяция после клипа соединяет куски через дыру
+    # «под сеткой» прямыми отрезками вниз; убираем такие точки ещё раз (клип
+    # идемпотентен) — в анализ/рендер уходит трек СТРОГО выше уровня сетки.
+    track, _clip2 = clip_track_above_net(track, net)
+    clip_stats["removed_below"] += _clip2["removed_below"]
+
+    # --- проход 3: розыгрыши → параболические пасы -----------------------------
     set_gravity_px(fps, settings.gravity_fit_ratio)  # размерность px/s^2 для фита
     rallies, pass_segs = detect_passes(
         track, fps, width, height,
@@ -166,11 +223,14 @@ def analyze_video(path: str, detector: VballNetDetector | None = None,
     analysis.ball_track_points = [{"frame": int(f), "x": round(x, 1), "y": round(y, 1)}
                                   for f, x, y in track]
     analysis.rallies = rallies
-
-    # оценка диаметра мяча по локальной плотности трека (медиана шага не годится —
-    # берём фиксированную разумную величину: heatmap-детектор даёт центр,
-    # диаметр ≈ 3.5% высоты кадра для волейбола на типовой съёмке)
-    ball_diam_px = max(8.0, height * 0.035)
+    analysis.removed_outliers = {
+        "eps_px": round(eps, 1),
+        "n_removed": len(dropped),
+        "n_track_before": len(track_all),
+        "points": [[int(f), round(x, 1), round(y, 1)] for f, x, y in dropped][:200],
+    }
+    analysis.net_level = net
+    analysis.net_clip_stats = clip_stats
     analysis.ball_radius_px = ball_diam_px / 2.0
 
     # привязка пасов к розыгрышам

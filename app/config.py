@@ -123,10 +123,21 @@ class Settings:
     #   ||p_i - p_{i-1}|| > eps  И  ||p_i - p_{i+1}|| > eps
     #   И  ||p_{i-1} - p_{i+1}|| <= eps
     # т.е. точка — изолированный выброс на траектории (фоновая текстура, блик).
-    # eps по умолчанию ≈ диагонали мяча при максимальном реальном перемещении
-    # за кадр (~5 px @ 240 fps для волейбольного мяча 21 см) + удвоенный радиус.
+    # Применяется в pipeline.analyze_video ДО розыгрышей/пасов (remove_outliers).
+    #
+    # КАК НАСТРАИВАТЬ EPS (BT_OUTLIER_EPS_PX):
+    #   BT_OUTLIER_EPS_PX > 0  — фиксированный eps прямо в пикселях (переопре-
+    #       деляет авто; поднимать — меньше точек считается выбросами, опу-
+    #       скать — больше). Пример: для 1080p разумно 60–120 px.
+    #   BT_OUTLIER_EPS_PX = 0 (по умолчанию) — авто по формуле
+    #       eps = max(BT_OUTLIER_MAX_SPEED/fps, diam) + BT_OUTLIER_BALL_MULT*diam,
+    #       где diam = 3.5% высоты кадра; ограничено сверху 25% высоты кадра.
+    #       T.e. eps контролируются двумя множителями:
+    #   BT_OUTLIER_MAX_SPEED  — «разумный максимум» скорости мяча, px/сек
+    #       (больше → eps больше → жёстче пропускаем телепортации);
+    #   BT_OUTLIER_BALL_MULT  — запас в диаметрах мяча сверх максимального шага.
     outlier_eps_px: float = float(os.getenv("BT_OUTLIER_EPS_PX", "0"))  # 0 → авто
-    outlier_eps_max_jump_px: float = float(os.getenv("BT_OUTLIER_MAX_JUMP", "5"))
+    outlier_eps_max_speed_px_s: float = float(os.getenv("BT_OUTLIER_MAX_SPEED", "1200"))
     outlier_eps_ball_diam_mult: float = float(os.getenv("BT_OUTLIER_BALL_MULT", "2"))
 
     # --- Отображение только части траектории ВЫШЕ сетки ------------------------
@@ -136,11 +147,21 @@ class Settings:
     # уровень не задан явно и автооценка невозможна (площадка/игроки не видны
     # или их геометрия неконсистентна — например, сетки в кадре нет вовсе),
     # ограничение НЕ применяется и рисуются все траектории целиком.
+    # Применяется в pipeline.analyze_video: estimate_net_level + clip_track_above_net.
     net_top_px: int = int(os.getenv("BT_NET_TOP_PX", "0"))          # явный уровень, px (0 → авто)
     net_top_height_m: float = float(os.getenv("BT_NET_TOP_HEIGHT_M", "2.43"))
     net_scale_min_px_per_m: float = float(os.getenv("BT_NET_SCALE_MIN", "50.0"))
     net_scale_max_px_per_m: float = float(os.getenv("BT_NET_SCALE_MAX", "800.0"))
     only_above_net: bool = os.getenv("BT_ONLY_ABOVE_NET", "1") == "1"
+    # Автооценка уровня сетки без разметки кадра (auto_court_geometry): трек
+    # мяча даёт «землю» (перцентиль 0.85 y-координат), а уровень игры руками
+    # принимается на доле высоты кадра между_lo/_hi; player_height_frac — доля
+    # высоты кадра, занимаемая ростом игрока (для типовой трансляции ~0.62H ↔
+    # 1.9 м при потолке 3 м). Ракурс сильно влияет — при сомнении задайте
+    # BT_NET_TOP_PX явно (см. BT_NET_TOP_PX выше).
+    net_auto_ground_lo_frac: float = float(os.getenv("BT_NET_AUTO_GROUND_LO", "0.55"))
+    net_auto_ground_hi_frac: float = float(os.getenv("BT_NET_AUTO_GROUND_HI", "0.90"))
+    net_auto_player_height_m: float = float(os.getenv("BT_NET_AUTO_PLAYER_FRAC", "0.62"))
 
     # --- Отрисовка траекторий поверх видео -------------------------------------
     render_tracked_video: bool = os.getenv("BT_RENDER_VIDEO", "1") == "1"

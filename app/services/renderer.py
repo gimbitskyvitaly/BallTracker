@@ -79,19 +79,46 @@ class FlightOverlay:
         return self.release_frame <= frame_id <= self.catch_frame
 
 
+def _draw_net_level(frame: np.ndarray, analysis) -> None:
+    """Горизонт на уровне ВЕРХНЕЙ ленты сетки (243 см), если он определён.
+
+    Всё НИЖЕ этой линии — зона, которая по ТЗ не отображается (клип
+    clip_track_above_net уже убрал такие точки из трека; линия показывает
+    границу). Если net_level is None (сетки в кадре нет / уровень не оценён) —
+    ничего не рисуем, лимит не применялся.
+    """
+    net = getattr(analysis, "net_level", None)
+    if net is None:
+        return
+    h_img, w_img = frame.shape[:2]
+    y = int(max(0, min(h_img - 1, net.y_px)))
+    cv2.line(frame, (0, y), (w_img - 1, y), (0, 160, 255), 2, cv2.LINE_AA)
+    tag = f"NET TOP {net.net_height_m*100:.0f}cm ({net.source}, y={y}px)"
+    cv2.putText(frame, tag, (8, max(14, y - 6)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 160, 255), 1, cv2.LINE_AA)
+
+
 def draw_flight(frame: np.ndarray, fl: FlightOverlay, ball_radius: int,
-                trail_length: int, fid: int, hold_left: int = 0) -> None:
+                trail_length: int, fid: int, hold_left: int = 0,
+                net_y: float | None = None) -> None:
     """Рисуем на frame всё, что относится к пасу fl на кадре fid.
 
     hold_left > 0 — полёт уже завершён, осталось «эхо»: без текущего мяча
     и хвоста, только полная дуга и маркеры, постепенно бледнеющие.
+    net_y — если задан, траектория/маркеры НИЖЕ уровня сетки не рисуем
+    (отображаем только части выше сетки; см. BT_ONLY_ABOVE_NET).
     """
+    def above(p) -> bool:
+        return net_y is None or p[2] <= net_y
+
     h_img, w_img = frame.shape[:2]
     fading = hold_left > 0
     cur = None if fading else _point_at_time(fl.pts, float(fid))
+    if cur is not None and not above((0, cur[0], cur[1])):
+        cur = None                                       # мяч под сеткой — не рисуем
 
     # --- полная дуга паса ------------------------------------------------------
-    done = [p for p in fl.pts if p[0] <= fid]
+    done = [p for p in fl.pts if p[0] <= fid and above(p)]
     if len(done) >= 2:
         pts_np = np.array([(int(x), int(y)) for _, x, y in done], dtype=np.int32)
         mask = np.zeros((h_img, w_img), np.uint8)
@@ -122,6 +149,8 @@ def draw_flight(frame: np.ndarray, fl: FlightOverlay, ball_radius: int,
     for (px, py), label in mk:
         if label == "CATCH" and not caught:
             continue
+        if not above((0, px, py)):
+            continue                                     # точка ниже сетки — не рисуем
         cv2.drawMarker(frame, (int(px), int(py)), fl.color, cv2.MARKER_CROSS,
                        16, 2, cv2.LINE_AA)
         cv2.putText(frame, label, (int(px) + 10, int(py) - 8),
@@ -131,14 +160,15 @@ def draw_flight(frame: np.ndarray, fl: FlightOverlay, ball_radius: int,
     mx, my = (rx + kx) / 2, (ry + ky) / 2
     dx = 1 if fl.direction == "right" else -1
     arr_len = 26
-    cv2.arrowedLine(frame, (int(mx) - dx * arr_len // 2, int(my) - 18),
-                    (int(mx) + dx * arr_len // 2, int(my) - 18),
-                    fl.color, 2, cv2.LINE_AA, tipLength=0.4)
+    if above((0, mx, my)):
+        cv2.arrowedLine(frame, (int(mx) - dx * arr_len // 2, int(my) - 18),
+                        (int(mx) + dx * arr_len // 2, int(my) - 18),
+                        fl.color, 2, cv2.LINE_AA, tipLength=0.4)
 
     if not fading and cur is not None:
         cx, cy = cur
         # --- затухающий хвост ------------------------------------------------------
-        past = [p for p in fl.pts if p[0] <= fid][-trail_length:]
+        past = [p for p in fl.pts if p[0] <= fid and above(p)][-trail_length:]
         if not past or past[-1][0] != fid:
             past = past + [(fid, cx, cy)]
         n = len(past)
@@ -233,11 +263,20 @@ def _draw_full_trajectory(frame: np.ndarray, analysis, fid: int,
       * HUD: кадры/трек/покрытие трека баллистическими фитами (coverage).
     """
     h_img, w_img = frame.shape[:2]
-    track = [(p["frame"], p["x"], p["y"]) for p in analysis.ball_track_points]
+    net = getattr(analysis, "net_level", None)
+    net_y = float(net.y_px) if net is not None else None
+
+    def above(p) -> bool:
+        return net_y is None or p[2] <= net_y
+
+    track = [(p["frame"], p["x"], p["y"]) for p in analysis.ball_track_points
+             if above((0, p["x"], p["y"]))]
     if not track:
         return
 
-    # --- линия сетки -----------------------------------------------------------
+    # --- уровень ВЕРХНЕЙ ленты сетки (горизонт, 243 см) -------------------------
+    _draw_net_level(frame, analysis)
+    # вертикальная проекция сетки (центр кадра) — ориентир направления пасов
     net_x = int(w_img / 2)
     cv2.line(frame, (net_x, 0), (net_x, h_img - 1), (255, 255, 0), 1, cv2.LINE_AA)
     cv2.putText(frame, "NET", (net_x + 4, 16), cv2.FONT_HERSHEY_SIMPLEX,
@@ -306,20 +345,25 @@ def _draw_full_trajectory(frame: np.ndarray, analysis, fid: int,
         if o.active(fid, 12):
             try:
                 draw_flight(frame, o, ball_r, trail_length, fid,
-                            hold_left=max(0, fid - o.catch_frame))
+                            hold_left=max(0, fid - o.catch_frame), net_y=net_y)
             except Exception:  # noqa: BLE001
                 pass
 
     # --- HUD --------------------------------------------------------------------
     cov = diag.get("coverage_px", {})
+    ro = getattr(analysis, "removed_outliers", None) or {}
+    nc = getattr(analysis, "net_clip_stats", None) or {}
     lines = [
         f"MODE FULL  f{fid}/{analysis.n_frames}",
         f"track={len(track)} ({analysis.detection_rate:.0%}) rallies={len(analysis.rallies)}",
+        f"outliers removed={ro.get('n_removed', 0)} eps={ro.get('eps_px', '-')}px",
+        ("net clip: y=" + (f"{nc['net_y_px']}px ({nc['source']}) rm={nc['removed_below']}"
+                           if nc.get("applied") else "NOT APPLIED (net not found)")),
         f"raw fits={diag.get('total_raw_fits', 0)} pass-filters={diag.get('total_would_pass', 0)}"
         f" passes={len(analysis.passes)}",
         f"ballistic coverage={cov.get('coverage', 0):.0%}",
     ]
-    bw, bh = min(330, max(40, w_img - 20)), 4 * 20 + 12
+    bw, bh = min(360, max(40, w_img - 20)), len(lines) * 20 + 12
     cv2.rectangle(frame, (10, 10), (10 + bw, 10 + bh), (0, 0, 0), -1)
     roi = frame[10:10 + bh, 10:10 + bw]
     cv2.addWeighted(roi.copy(), 0.55, frame[10:10 + bh, 10:10 + bw], 0.45, 0,
@@ -361,6 +405,8 @@ def render_tracked_video(src_path: str, dst_path: str, analysis,
         out = cv2.VideoWriter(dst_path, cv2.VideoWriter_fourcc(*"avc1"), fps, (w, h))
 
     ball_r = max(4, int(getattr(analysis, "ball_radius_px", 6)))
+    net = getattr(analysis, "net_level", None)
+    net_y = float(net.y_px) if net is not None else None
     fid = 0
     while True:
         ok, frame = cap.read()
@@ -373,12 +419,14 @@ def render_tracked_video(src_path: str, dst_path: str, analysis,
             except Exception:  # noqa: BLE001 — рендер не должен валить job
                 traceback.print_exc()
         else:
+            _draw_net_level(frame, analysis)   # граница «выше сетки» видна всегда
             for o in overlays:
                 if not o.active(fid, tail_hold_frames):
                     continue
                 try:
                     draw_flight(frame, o, ball_r, trail_length, fid,
-                                hold_left=max(0, fid - o.catch_frame))
+                                hold_left=max(0, fid - o.catch_frame),
+                                net_y=net_y)
                 except Exception:  # noqa: BLE001 — рендер не должен валить job
                     pass
         out.write(frame)

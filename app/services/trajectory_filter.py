@@ -35,18 +35,22 @@ BallPoint = tuple[int, float, float]          # (frame, x, y)
 
 
 # --------------------------------------------------------- ложные детекции
-def default_outlier_eps(fps: float, height: int, *, max_jump_px: float,
+def default_outlier_eps(fps: float, height: int, *, max_speed_px_s: float,
                         ball_diam_mult: float, ball_diam_px: float) -> float:
-    """Авто-eps: максимальное честное перемещение за кадр + запас на диаметр мяча.
+    """Авто-eps: максимальное честное перемещение между соседними точками трека
+    (v_max * dt_med) + запас на диаметр мяча.
 
-    max_jump_px задаётся как «px за кадр при 30 fps»; для более частых видео
-    допустимое перемещение за кадр пропорционально меньше (скорость та же).
-    Дополнительно ограничиваем сверху долей высоты кадра — защита от абсурдных
-    eps на нестандартных разрешениях.
+    max_speed_px_s — «разумный максимум» скорости мяча в px/сек (реальный
+    волейбольный мяч на типовой трансляции летит не быстрее ~1200 px/s);
+    пересчитывается в px/кадр через медианный шаг кадров трека (fps), поэтому
+    корректно работает и на 25 fps, и на 240 fps. Ограничиваем снизу диаметром
+    мяча (иначе шум детекции на медленных участках сам станет «выбросом») и
+    сверху долей высоты кадра — защита от абсурдных eps.
     """
     fps = max(fps, 1.0)
-    per_frame = max_jump_px * (30.0 / fps)
-    eps = per_frame + ball_diam_mult * max(ball_diam_px, 8.0)
+    diam = max(ball_diam_px, 8.0)
+    per_frame = max_speed_px_s / fps
+    eps = max(per_frame, diam) + ball_diam_mult * diam
     return min(eps, 0.25 * max(height, 1))
 
 
@@ -138,10 +142,11 @@ def estimate_net_level(height: int, width: int, geo: CourtGeometry | None, *,
     применяется, рисуем всю траекторию).
     """
     if manual_y_px and manual_y_px > 0:
-        scale = manual_y_px / net_height_m
+        # явная отметка пользователя НЕ проверяется scale_min/max (масштаб
+        # может быть любым из-за ракурса) — только физический смысл уровня
         return NetLevel(y_px=float(manual_y_px), source="manual",
-                        scale_px_per_m=scale, net_height_m=net_height_m,
-                        notes="BT_NET_TOP_PX")
+                        scale_px_per_m=manual_y_px / net_height_m,
+                        net_height_m=net_height_m, notes="BT_NET_TOP_PX")
     if geo is None:
         return None
 
@@ -195,3 +200,55 @@ def clip_track_above_net(track: list[BallPoint], net: NetLevel | None, *,
     if len(kept) < min_points:
         return [], stats
     return kept, stats
+
+
+# ------------------------------------------------ автооценка геометрии кадра
+def estimate_ground_y(ball_points: list[BallPoint]) -> float | None:
+    """Уровень «земли» (пол/руки игроков) по нижним огибающим точек мяча.
+
+    Мяч большую часть розыгрыша находится ВЫШЕ уровня игры руками (~1.5–2 м),
+    поэтому медиана y всех точек трека — устойчивая оценка горизонта игры;
+    берём перцентиль 0.85 (нижняя огибающая) как уровень земли y_g в px.
+    None — если данных мало (<20 точек).
+    """
+    if len(ball_points) < 20:
+        return None
+    ys = np.array([p[2] for p in ball_points], float)
+    return float(np.percentile(ys, 85.0))
+
+
+def auto_court_geometry(ball_points: list[BallPoint], height: int, *,
+                        ground_frac_lo: float, ground_frac_hi: float,
+                        player_height_frac: float
+                        ) -> CourtGeometry | None:
+    """CourtGeometry из одного только трека мяча (без разметки/детекции людей).
+
+    Пайплайн не детектирует линию площади и игроков, поэтому near_edge_y и
+    «рост игроков в px» напрямую взять неоткуда. Масштаб оцениваем по ДВУМ
+    якорям плоскости сетки:
+      * верхний якорь y_play = H * player_height_frac — типичная ВЕРХНЯЯ точка
+        полётов (пас/атака на уровне вытянутых рук ~2.0–2.4 м); для волейболь-
+        ной трансляции с потолком 5–7 м это 0.30–0.45H;
+      * нижний якорь y_g = перцентиль 0.85 y-координат трека — уровень игры у
+        земли (~0.6–1.2 м, приём/передача снизу).
+    Между ними ≈ player_height_m метров (разница высот рук над головой и
+    принятия мяча у пояса) ⇒ scale = (y_g − y_play)/player_height_m, а уровень
+    сетки 2.43 м лежит НАД верхним якорем: net_y = y_play − scale*(2.43 −
+    player_height_m + 0.45). При неконсистентности якорей (земля выше уровня
+    игры или слишком далеко) вернём None → estimate_net_level откажет и лимит
+    не применится («сетки нет / плохо видна»).
+    """
+    y_g = estimate_ground_y(ball_points)
+    if y_g is None:
+        return None
+    y_play = height * ground_frac_lo          # верхняя огибающая полётов
+    # земля должна быть НИЖЕ уровня игры и в разумных пределах кадра
+    if not (y_play < y_g < ground_frac_hi * height):
+        return None
+    span_px = max(y_g - y_play, 1.0)
+    scale = span_px / player_height_frac      # px на метр разницы высот якорей
+    return CourtGeometry(near_edge_y=None, far_edge_y=y_g,
+                         players_px=[scale * player_height_m_default])
+
+
+player_height_m_default = 1.90   # рост игрока, м (для перевода scale в px-«рост»)
