@@ -39,7 +39,8 @@ from app.services.physics import estimate_flight, set_gravity_px
 from app.services.trajectory_filter import (BallPoint, NetLevel,
                                             clip_track_above_net,
                                             estimate_net_level,
-                                            remove_outliers,
+                                            remove_outliers_velocity,
+                                            remove_static_hotspots,
                                             split_track_by_jumps)
 from app.services.vballnet import VballNetDetector
 
@@ -158,41 +159,71 @@ def analyze_video(path: str, detector: VballNetDetector | None = None,
     frames_read = max(frames_read, 1)
     detected = len(raw)
 
-    # --- проход 2: трек → фильтрация ложных детекций → разрыв по быстрым
-    #     перелётам (новый розыгрыш) → клип выше сетки -------------------------
-    # Логика ровно из ТЗ, один явный небольшой epsilon (BT_OUTLIER_EPS_PX):
-    #   * изолированная точка-«телепорт» (далека от обеих соседок, а соседки
-    #     рядом) — ложная детекция, выбрасывается (remove_outliers);
-    #   * большой шаг, после которого трек продолжается далеко — мяч честно
-    #     быстро перелетел (атака/подача): трек РАЗРЫВАЕТСЯ здесь, куски —
-    #     разные розыгрыши (split_track_by_jumps).
-    # Затем точки НИЖЕ верхней ленты сетки (243 см) не участвуют в анализе и
-    # не отображаются (estimate_net_level + clip_track_above_net).
+    # --- проход 2: трек → скоростной шлюз ложных детекций → разрыв по
+    #     физически невозможным телепортам (новый розыгрыш) → клип выше сетки --
+    # Логика (config BT_GATE_*):
+    #   * remove_outliers_velocity — РЕАЛЬНЫЕ наблюдения (без интерполяции!)
+    #     разбиваются на когерентные цепочки («мяч» = последовательность с
+    #     согласованной скоростью; «статичный hotspot-фон» = точки, стоящие в
+    #     одной клетке кадра много кадров подряд). Цепочка считается ложью и
+    #     удаляется ЦЕЛИКОМ, если она статична (разброс < static_radius_px),
+    #     длиннее min_streak кадров И при этом рядом/между её кадрами есть
+    #     другая цепочка, физически согласованная с движением мяча (т.е.
+    #     настоящий мяч в это время был в другом месте). Так вычищаются
+    #     чередования «мяч/hotspot», которые не брал старый eps-фильтр;
+    #     одиночные честные шумы и смены направления НЕ удаляются;
+    #   * split_track_by_jumps — трек рвётся только там, где dist/dt между
+    #     соседними РЕАЛЬНЫМИ наблюдениями превышает физический максимум
+    #     скорости мяча (телепорт = новый розыгрыш). Старый разрез «по
+    #     расстоянию > eps» на быстром полёте резал трек на микро-осколки
+    #     (< par_min_frames), из-за чего пасы не находились и API отдавал
+    #     flights=[].
     ball_diam_px = max(8.0, height * 0.035)   # диаметр ≈ 3.5% высоты кадра
 
-    eps = settings.outlier_eps_px             # ЯВНЫЙ eps (config BT_OUTLIER_EPS_PX)
+    gate_mult = settings.gate_mult
+    v_min_px = settings.v_min_px
+    speed_max = settings.max_ball_speed_px_f
     track_all = _interp_track(raw, gap_max=settings.rally_gap_frames)
-    track, dropped = remove_outliers(track_all, eps)
-    # интерполяция разрывов ПОВТОРНО: remove_outliers вырывает точки-выбросы,
-    # на их месте остаются дыры (разрыв ровно в 1 кадр), из-за которых
-    # find_parabolic_segments отказывался брать окно (запрет diff > gap_break).
-    track = _interp_track(track, gap_max=settings.rally_gap_frames)
-    # добить цепочки выбросов (первая итерация могла обнажить новые изолиро-
-    # ванные точки); повторный split здесь не нужен — он идемпотентен.
+    pts_sorted = sorted(raw, key=lambda p: p[0])
+    dropped: list[tuple[int, float, float]] = []
     extra_removed = 0
-    while True:
-        track2, more = remove_outliers(track, eps)
-        if not more:
-            break
-        extra_removed += len(more)
-        dropped.extend(more)
-        track = _interp_track(track2, gap_max=settings.rally_gap_frames)
-    # честные быстрые перелёты (атака/подача) разрывают трек: каждый кусок —
+    if settings.static_filter_enabled and len(pts_sorted) >= 3:
+        track, dropped = remove_static_hotspots(
+            pts_sorted, cell_px=settings.static_cell_px,
+            radius_px=settings.static_radius_px,
+            min_streak=max(settings.min_streak, 2),
+            speed_max_px_f=speed_max,
+            rally_gap_frames=settings.rally_gap_frames)
+        extra_removed = len(dropped)          # единый счётчик для API/отладки
+    else:
+        # старый скоростной шлюз (цепочки несогласованных точек) — резервный
+        # режим BT_STATIC_FILTER=0
+        track, dropped = remove_outliers_velocity(
+            pts_sorted, gate_mult=gate_mult, v_min_px=v_min_px,
+            speed_max_px_f=speed_max, window=settings.gate_window,
+            min_streak=settings.min_streak)
+        while True:
+            track2, more = remove_outliers_velocity(
+                track, gate_mult=gate_mult, v_min_px=v_min_px,
+                speed_max_px_f=speed_max, window=settings.gate_window,
+                min_streak=settings.min_streak)
+            if not more:
+                break
+            extra_removed += len(more)
+            dropped.extend(more)
+            track = track2
+    # интерполяция разрывов ПОСЛЕ чистки: удалённые выбросы оставляют дыры
+    # (разрыв ровно в 1 кадр), из-за которых find_parabolic_segments
+    # отказывался брать окно (запрет diff > gap_break).
+    track = _interp_track(track, gap_max=settings.rally_gap_frames)
+    # физически невозможные телепорты разрывают трек: каждый кусок —
     # отдельный розыгрыш; пасы ищутся НЕЗАВИСИМО внутри каждого куска.
     segments: list[list[BallPoint]] = []
     rest = track
     while True:
-        head, jumped = split_track_by_jumps(rest, eps)
+        head, jumped = split_track_by_jumps(
+            rest, speed_max, rally_gap_frames=settings.rally_gap_frames,
+            jump_tolerance=settings.jump_tolerance)
         segments.append(head)
         if not jumped:
             break
@@ -251,7 +282,9 @@ def analyze_video(path: str, detector: VballNetDetector | None = None,
                                   for f, x, y in track]
     analysis.rallies = rallies
     analysis.removed_outliers = {
-        "eps_px": round(eps, 1),
+        "gate_mult": round(gate_mult, 2),
+        "v_min_px": round(v_min_px, 1),
+        "max_ball_speed_px_f": round(speed_max, 1),
         "n_removed": len(dropped),
         "n_extra_removed": extra_removed,
         "n_rally_splits": n_splits,

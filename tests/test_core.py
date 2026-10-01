@@ -432,30 +432,67 @@ class TestPipelineTrackBuilding:
 
 
 class TestTrajectoryFilter:
-    """Ложные детекции (один явный eps) + разрыв трека на розыгрыши + сетка."""
+    """Скоростной шлюз ложных детекций + разрыв трека по макс. скорости + сетка."""
 
-    EPS = 60.0
+    GATE = 3.0
+    VMIN = 16.0
+    SMAX = 120.0
+
+    def _clean(self, pts):
+        from app.services.trajectory_filter import remove_outliers_velocity
+        return remove_outliers_velocity(pts, gate_mult=self.GATE,
+                                        v_min_px=self.VMIN,
+                                        speed_max_px_f=self.SMAX)
 
     def test_isolated_teleport_removed(self):
-        from app.services.trajectory_filter import remove_outliers
         pts = [(i, float(i * 5), 100.0) for i in range(10)]
         pts.insert(5, (5, 400.0, 400.0))            # ложная точка-телепорт
-        kept, dropped = remove_outliers(pts, self.EPS)
+        kept, dropped = self._clean(pts)
         assert len(dropped) == 1 and len(kept) == 10
         assert dropped[0][1] == 400.0
 
+    def test_alternating_hotspot_chain_removed(self):
+        """Главный регресс на реальном видео: ложные heatmap-срабатывания
+        приходят ЧЕРЕДУЮЩИМИСЯ hotspot'ами (по 2+ кадра в одной точке).
+        Старое eps-правило («обе соседки рядом») их НЕ видело; скоростной
+        шлюз обязан вычистить всю цепочку, сохранив полёт мяча."""
+        fly = [(f, 100.0 + 8.0 * f, 300.0 - 2.0 * f) for f in range(0, 20)]
+        hot1 = [(2, 1700.0, 600.0), (3, 1701.0, 601.0)]     # static hotspot A
+        hot2 = [(9, 60.0, 950.0), (10, 61.0, 949.0)]        # static hotspot B
+        pts = sorted(fly + hot1 + hot2, key=lambda p: p[0])
+        kept, dropped = self._clean(pts)
+        removed_frames = {p[0] for p in dropped}
+        assert {2, 3, 9, 10} <= removed_frames, "цепочка hotspot'ов удалена"
+        # весь честный полёт сохранён
+        assert all(any(k[0] == f for k in kept) for f in range(0, 20))
+
     def test_fast_flight_not_removed_but_split(self):
-        """p_i далеко от p_{i-1}, соседки НЕ рядом → это атака/подача:
-        точку не выбрасываем, а трек режем — куски = разные розыгрыши."""
-        from app.services.trajectory_filter import (remove_outliers,
-                                                   split_track_by_jumps)
+        """Честный быстрый перелёт (атака/подача): точки НЕ выбрасываются
+        (шлюз пропорционален скорости); трек рвётся только там, где шаг
+        физически невозможен (dist/dt > speed_max) — граница розыгрышей."""
         left = [(i, float(i * 5), 100.0) for i in range(5)]           # x 0..20
         right = [(100 + i, 900.0 + i * 5, 300.0) for i in range(5)]  # после прыжка
         pts = left + right
-        kept, dropped = remove_outliers(pts, self.EPS)
+        kept, dropped = self._clean(pts)
         assert dropped == []                        # ничего не «ложное»
-        head, jumped = split_track_by_jumps(kept, self.EPS)
+        from app.services.trajectory_filter import split_track_by_jumps
+        head, jumped = split_track_by_jumps(kept, self.SMAX)
         assert jumped == 1 and head == left         # разрез ровно в месте прыжка
+
+    def test_no_micro_splits_on_dense_fast_flight(self):
+        """Регресс flights=[]: раньше разрез «по расстоянию > eps» рвал плотный
+        быстрый полёт (шаг 40 px/кадр при eps=10) на микро-осколки. Теперь
+        порог — скорость px/кадр: 40 < 120 → трек остаётся цельным."""
+        from app.services.trajectory_filter import split_track_by_jumps
+        fast = [(i, float(i * 40), 200.0 + i * 10) for i in range(10)]
+        segs, rest = [], fast
+        while True:
+            head, jumped = split_track_by_jumps(rest, self.SMAX)
+            segs.append(head)
+            if not jumped:
+                break
+            rest = rest[len(head):]
+        assert len(segs) == 1 and segs[0] == fast
 
     def test_net_level_manual_and_fixed_default(self):
         from app.services.trajectory_filter import estimate_net_level
