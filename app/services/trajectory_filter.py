@@ -1,20 +1,36 @@
 """Фильтрация траектории мяча: ложные детекции и уровень сетки.
 
-1) ЛОЖНЫЕ ДЕТЕКЦИИ (изолированные выбросы). Явный небольшой epsilon (px),
-   правило ровно из ТЗ:
-       p_i — ложная, если  ||p_i - p_{i-1}|| > eps  И  ||p_i - p_{i+1}|| > eps
-                            И ||p_{i-1} - p_{i+1}|| <= eps
-   т.е. соседки стоят «рядом» (мяч никуда не делся), а p_i телепортировалась —
-   это фоновое срабатывание heatmap-детектора (блик, текстура). Точка просто
-   выбрасывается.
+1) ЛОЖНЫЕ ДЕТЕКЦИИ — СКОРОСТНОЙ ШЛЮЗ (velocity gate).
+   Раньше стояло чисто геометрическое правило по явному epsilon:
+       p_i — ложная, если ||p_i-p_{i-1}|| > eps И ||p_i-p_{i+1}|| > eps
+                           И ||p_{i-1}-p_{i+1}|| <= eps
+   На реальном видео оно НЕ РАБОТАЕТ: ложные срабатывания heatmap-детектора
+   приходят ЦЕПОЧКАМИ/чередованиями (горячая точка фона детектируется в
+   нескольких подряд идущих кадрах, чередуясь с настоящим мячом), поэтому
+   условие «соседки рядом» для них никогда не выполняется — выбросы оставались
+   в треке при любом eps. А уменьшение eps лишь резало трек на осколки:
+   расстояние между соседними ВАЛИДНЫМИ точками на быстром полёте само по
+   себе больше eps → фильтр считал настоящий полёт «цепочкой прыжков»,
+   trек рвался на микро-куски (< par_min_frames) и API возвращал flights=[].
 
-   ВАЖНОЕ отличие от «быстрого полёта»: если p_i далеко от p_{i-1}, а соседки
-   p_{i-1} и p_{i+1} тоже НЕ рядом друг с другом — значит мяч действительно
-   быстро перелетел (атака/подача). Такую точку НЕ удаляем; вместо этого трек
-   режется в этом месте на части (split_track_by_jumps): каждый кусок — это
-   отдельный розыгрыш, и дальше по нему пасы ищутся независимо.
+   Новая логика (remove_outliers_velocity): точка отвергается, если она
+   отклоняется от ЛОКАЛЬНОЙ ЭКСТРАПОЛЯЦИИ ТРАЕКТОРИИ сильнее, чем допускает
+   физика мяча:
+       predicted = p_{i-1} + v_hat * dt            (v_hat — оценка скорости
+       residual  = ||p_i - predicted||             по предыдущим ~W точкам)
+       порог:    max_gate = gate_mult * max(||v_hat|| * dt, v_min_px)
+   Статичная горячая точка (v_hat≈0) даёт residual >> v_min → удаляется;
+   быстрый честный полёт имеет большую v_hat → порог пропорционален скорости,
+   точки полёта НЕ удаляются. После удаления точки оценка v_hat пересчиты-
+   вается по чищенным соседям, поэтому цепочки выбросов вычищаются итеративно.
 
-2) УРОВЕНЬ СЕТКИ (отображаем только части траектории выше сетки).
+2) РАЗРЫВ ТРЕКА (split_track_by_jumps) — теперь по физической максимальной
+   скорости мяча, а не по eps: разрыв ставится там, где шаг между соседними
+   ОСТАВЛЕННЫМИ точками превышает speed_max_px_f px/кадр (даже с учётом
+   интерполяции через удалённые точки). Это границы реальных розыгрышей;
+   микро-разрывы на каждом шаге быстрого полёта больше не возникают.
+
+3) УРОВЕНЬ СЕТКИ (отображаем только части траектории выше сетки).
    Верхняя лента сетки в волейболе — 243 см (мужчины; 224 см — женщины).
    Автоопределение по треку мяча без разметки кадра (старая оценка была
    нестабильна: на одном видео линия выше сетки, на другом «на земле», на
@@ -42,63 +58,204 @@ BallPoint = tuple[int, float, float]          # (frame, x, y)
 
 
 # --------------------------------------------------------- ложные детекции
-def remove_outliers(points: list[BallPoint], eps: float
-                    ) -> tuple[list[BallPoint], list[BallPoint]]:
-    """Возвращает (чищенные точки, выброшенные ложные детекции).
+def _local_velocity(keep: list[BallPoint], window: int) -> tuple[float, float] | None:
+    """Оценка скорости мяча (px/кадр) по последним `window` оставленным точкам.
 
-    Правило (ровно из ТЗ): p_i — ложная, если
-        dist(p_i, p_{i-1}) > eps  &&  dist(p_i, p_{i+1}) > eps
-        &&  dist(p_{i-1}, p_{i+1}) <= eps
-    Проверка идёт по СОСЕДНИМ ТОЧКАМ трека (не по индексу массива), что корректно
-    и при разрывах видимости. Итеративно (пока появляются новые изолированные
-    выбросы после удаления предыдущих).
+    LSQ-наклон берётся по РЕАЛЬНЫМ номерам кадров (не по позиции в массиве):
+    после удаления выбросов соседние элементы могут отстоять на много кадров,
+    и «наклон по индексу» занинял скорость в разы — шлюз съедал весь честный
+    полёт сразу после дыры в наблюдениях.
     """
-    if len(points) < 3 or eps <= 0:
-        return list(points), []
+    tail = keep[-window:] if window > 0 else keep
+    if len(tail) < 2:
+        return None
+    t = np.array([p[0] for p in tail], float)
+    x = np.array([p[1] for p in tail], float)
+    y = np.array([p[2] for p in tail], float)
+    dt = t[-1] - t[0]
+    if dt <= 0:
+        return None
+    A = np.stack([np.ones_like(t), t], axis=1)
+    try:
+        cx, *_ = np.linalg.lstsq(A, x, rcond=None)
+        cy, *_ = np.linalg.lstsq(A, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    return float(cx[1]), float(cy[1])
+
+
+def remove_outliers_velocity(points: list[BallPoint], *, gate_mult: float,
+                             v_min_px: float, speed_max_px_f: float,
+                             window: int = 6, min_streak: int = 2
+                             ) -> tuple[list[BallPoint], list[BallPoint]]:
+    """Скоростной шлюз ложных детекций. Возвращает (чищенные, выброшенные).
+
+    Для каждой очередной точки p_i строим прогноз из локальной экстраполяции
+    траектории:
+
+        v_hat     — LSQ-скорость (px/кадр) по последним `window` ОСТАВЛЕННЫМ
+                    наблюдениям (после удаления предыдущих выбросов — поэтому
+                    цепочки/чередования горячих точек вычищаются);
+        predicted = p_{last} + v_hat * dt,   dt = f_i - f_last;
+        residual  = ||p_i - predicted||.
+
+    Точка СЧИТАЕТСЯ ЛОЖНОЙ, если одновременно
+        a) residual > gate_mult * max(||v_hat||*dt, v_min_px) — далеко от
+           продолжения траектории; И
+        b) dist(p_i, p_{last}) > gate_mult * max(speed_max_px_f,
+           ||v_hat||*dt + v_min_px) * dt — она физически недосяжна от
+           ближайшей оставленной точки даже с учётом резкого ускорения.
+    Условие (b) спасает быстрый полёт сразу ПОСЛЕ большой дыры в наблюдениях
+    (первый кадр розыгрыша после длинного перерыва): там v_hat ≈ 0 и один
+    лишь residual съедал бы начало каждого полёта.
+
+    НАДЁЖНОСТЬ (главный урок реального видео): одиночная «несогласованная»
+    точка обычно — честный шум или смена направления мяча после удара,
+    поэтому удаляется только ЦЕПОЧКА из >= min_streak подряд несогласованных
+    точек, причём ВСЕГДА сохраняется самая правдоподобная из них — точка с
+    минимальным residual (как правило это настоящий мяч; ложные hotspot'ы
+    статичны и дают больший разброс).
+
+    ИСКЛЮЧЕНИЕ — классический одиночный «телепорт туда-обратно»: если сама
+    точка недосяжна (b), а предыдущая оставленная и следующая точки трека
+    рядом друг с другом (мяч никуда не делся) — это фоновое срабатывание,
+    оно удаляется даже без цепочки (условие старого eps-правила:
+    ||p_{i-1}-p_{i+1}|| <= gate_mult * v_min_px).
+
+    Первые две точки всегда остаются (экстраполировать не от чего).
+    """
+    if len(points) < 3:
+        return sorted(points, key=lambda p: p[0]), []
     pts = sorted(points, key=lambda p: p[0])
+    keep: list[BallPoint] = [pts[0], pts[1]]
     removed: list[BallPoint] = []
-    changed = True
-    while changed and len(pts) >= 3:
-        changed = False
-        keep: list[BallPoint] = [pts[0]]
-        i = 1
-        n = len(pts)
-        while i < n - 1:
-            pm1 = keep[-1]                       # предыдущая ОСТАВЛЕННАЯ точка
-            cur = pts[i]
-            pn1 = pts[i + 1]
-            d_prev = math.hypot(cur[1] - pm1[1], cur[2] - pm1[2])
-            d_next = math.hypot(cur[1] - pn1[1], cur[2] - pn1[2])
-            d_nbrs = math.hypot(pm1[1] - pn1[1], pm1[2] - pn1[2])
-            if d_prev > eps and d_next > eps and d_nbrs <= eps:
-                removed.append(cur)
-                changed = True
+
+    def is_fake(cur: BallPoint) -> tuple[bool, float]:
+        last = keep[-1]
+        dt = max(float(cur[0] - last[0]), 1e-9)
+        v = _local_velocity(keep, window)
+        d_last = math.hypot(cur[1] - last[1], cur[2] - last[2])
+        if v is None:
+            bad = speed_max_px_f > 0 and d_last > gate_mult * speed_max_px_f * dt
+            return bad, d_last
+        vx, vy = v
+        speed_now = math.hypot(vx, vy)
+        pred_x = last[1] + vx * dt
+        pred_y = last[2] + vy * dt
+        residual = math.hypot(cur[1] - pred_x, cur[2] - pred_y)
+        gate = gate_mult * max(speed_now * dt, v_min_px)
+        # недосягаемость: даже при резком ускорении мяч за dt не может
+        # пройти больше (v_текущ + a_max*dt)*dt; иначе первый кадр ПОСЛЕ
+        # длинной дыры наблюдений (v_hat≈0 от старых точек) ошибочно
+        # считался бы ложью и съедал начало каждого полёта
+        reach = gate_mult * max(speed_max_px_f, speed_now * dt + v_min_px) * dt
+        return (residual > gate and d_last > reach), residual
+
+    i = 2
+    n = len(pts)
+    while i < n:
+        bad0, r0 = is_fake(pts[i])
+        if not bad0:
+            keep.append(pts[i])
+            i += 1
+            continue
+        # собрать максимальную цепочку подряд несогласованных точек, НЕ
+        # изменяя keep (прогноз для всех — от текущего хвоста чищенного трека)
+        chain: list[tuple[BallPoint, float]] = [(pts[i], r0)]
+        j = i + 1
+        while j < n:
+            bad, r = is_fake(pts[j])
+            if not bad:
+                break
+            chain.append((pts[j], r))
+            j += 1
+        if len(chain) < min_streak:
+            # Одиночная несогласованность. Обычно оставляем её (шум/смена
+            # направления). НО если точка физически недосяжна, а следующая
+            # точка трека ВЕРНУЛАСЬ к траектории (рядом с предыдущей
+            # оставленной) — это телепорт «туда-обратно» = hotspot-ложь.
+            nxt = pts[j] if j < n else None
+            single_unreachable = False
+            if nxt is not None:
+                # «телепорт туда-обратно»: сама точка недосяжна, а следующая
+                # согласована со шлюзом И вернулась к предыдущей оставленной
+                # точке (мяч никуда не делся) → это фоновая hotspot-ложь.
+                bad_next, _ = is_fake(nxt)
+                nbr_gap = math.hypot(nxt[1] - keep[-1][1], nxt[2] - keep[-1][2])
+                dt_n = max(float(nxt[0] - keep[-1][0]), 1.0)
+                # допуск «рядом» с учётом честного движения за dt_n; при
+                # реальном быстром перелёте nxt сама недосяжна (ok_next=True)
+                # и правило не срабатывает — полёт сохраняется
+                nbr_tol = gate_mult * v_min_px * dt_n
+                if (not bad_next) and nbr_gap <= nbr_tol:
+                    single_unreachable = True
+            if single_unreachable:
+                removed.append(pts[i])
                 i += 1
                 continue
-            keep.append(cur)
+            # одиночная несогласованность — оставляем (не теряем реальные
+            # шумы/смену направления честного полёта)
+            keep.append(pts[i])
             i += 1
-        keep.append(pts[-1])                     # последняя точка не может быть «средней»
-        pts = keep
-    return pts, removed
+            continue
+        # из цепочки сохраняем САМУЮ правдоподобную точку (min residual) —
+        # но только если она согласуется с СОСЕДНИМИ наблюдениями: при
+        # чередовании «мяч/hotspot» самая близкая к экстраполяции точка и
+        # есть настоящий мяч. Если же вся цепочка стоит в одной точке фона
+        # (последующие точки рядом с первой, v≈0), правдоподобная — первая,
+        # а остальные — ложь; удаляется вся цепочка целиком
+        best_k = min(range(len(chain)), key=lambda k: chain[k][1])
+        best = chain[best_k][0]
+        nbr_ok = True
+        if j < n:                                   # следующая СОГЛАСОВАНА
+            nxt = pts[j]
+            d_nb = math.hypot(nxt[1] - best[1], nxt[2] - best[2])
+            dt_nb = max(float(nxt[0] - best[0]), 1.0)
+            nbr_ok = d_nb <= gate_mult * max(v_min_px * dt_nb, speed_max_px_f)
+        elif len(keep) >= 2:                        # хвост трека: согласованность
+            prev = keep[-1]                         # с предыдущей оставленной
+            d_pb = math.hypot(best[1] - prev[1], best[2] - prev[2])
+            dt_pb = max(float(best[0] - prev[0]), 1.0)
+            nbr_ok = d_pb <= gate_mult * max(v_min_px * dt_pb, speed_max_px_f)
+        if not nbr_ok:
+            removed.extend(p for p, _ in chain)     # статичный hotspot-фон
+            i = j
+            continue
+        for k, (p, _) in enumerate(chain):
+            if k == best_k:
+                keep.append(p)
+            else:
+                removed.append(p)
+        i = j
+    return keep, removed
 
 
-def split_track_by_jumps(points: list[BallPoint], eps: float
+def split_track_by_jumps(points: list[BallPoint], speed_max_px_f: float,
+                         rally_gap_frames: int = 0
                          ) -> tuple[list[BallPoint], int]:
-    """Разрезает трек там, где мяч ЧЕСТНО быстро перелетел (атака/подача).
+    """Разрезает трек на розыгрыши по физической границе скорости мяча.
 
-    После remove_outliers любая пара соседних точек трека с расстоянием > eps
-    — это уже НЕ ложная детекция (одиночные «телепортации» удалены), а реальный
-    быстрый перелёт. По ТЗ такой момент означает начало нового розыгрыша,
-    поэтому трек разрывается ровно здесь. Возвращает (ПЕРВЫЙ кусок до прыжка,
-    1) либо (весь трек, 0) — вызывающий цикл забирает хвост rest[len(head):]
-    и повторяет, пока разрывы не кончатся.
+    Разрыв ставится только там, где СРЕДНЯЯ скорость между соседними
+    оставленными точками (dist/dt в px/КАДР, dt — разница номеров кадров)
+    превышает speed_max_px_f — т.е. шаг физически невозможен даже для
+    самого быстрого удара; ЛИБО разрыв в кадрах больше rally_gap_frames
+    (мяч не детектировался дольше окна розыгрыша — граница эпизода даже
+    если точки стоят рядом). Раньше резали по простому расстоянию > eps:
+    на быстром полёте каждый кадр даёт шаг > eps и трек рассыпался на
+    микро-осколки короче par_min_frames (flights=[]). Теперь обычный
+    пас/атака (шаг 20–80 px/кадр) остаётся цельным, а рвутся только
+    настоящие склейки разных эпизодов (teleport через весь кадр).
+    Возвращает (ПЕРВЫЙ кусок до разрыва, 1) либо (весь трек, 0).
     """
-    if len(points) < 2 or eps <= 0:
-        return list(points), 0
+    if len(points) < 2 or speed_max_px_f <= 0:
+        return sorted(points, key=lambda p: p[0]), 0
     pts = sorted(points, key=lambda p: p[0])
     for i in range(len(pts) - 1):
         a, b = pts[i], pts[i + 1]
-        if math.hypot(b[1] - a[1], b[2] - a[2]) > eps:
+        dt = max(float(b[0] - a[0]), 1.0)
+        if rally_gap_frames and dt > rally_gap_frames:
+            return pts[:i + 1], 1
+        if math.hypot(b[1] - a[1], b[2] - a[2]) / dt > speed_max_px_f:
             return pts[:i + 1], 1
     return pts, 0
 
