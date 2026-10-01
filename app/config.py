@@ -117,6 +117,31 @@ class Settings:
     # отличающее настоящий перелёт «к сетке» от дребезга/ведения мяча.
     min_horizontal_disp_frac: float = float(os.getenv("BT_MIN_DISP_FRAC", "0.06"))
 
+    # --- Фильтрация ложных детекций ------------------------------------------
+    # Точка p_i выбрасывается как ложная, если она «выпрыгивает» из окрестности
+    # обеих соседок, а соседи близки друг к другу:
+    #   ||p_i - p_{i-1}|| > eps  И  ||p_i - p_{i+1}|| > eps
+    #   И  ||p_{i-1} - p_{i+1}|| <= eps
+    # т.е. точка — изолированный выброс на траектории (фоновая текстура, блик).
+    # eps по умолчанию ≈ диагонали мяча при максимальном реальном перемещении
+    # за кадр (~5 px @ 240 fps для волейбольного мяча 21 см) + удвоенный радиус.
+    outlier_eps_px: float = float(os.getenv("BT_OUTLIER_EPS_PX", "0"))  # 0 → авто
+    outlier_eps_max_jump_px: float = float(os.getenv("BT_OUTLIER_MAX_JUMP", "5"))
+    outlier_eps_ball_diam_mult: float = float(os.getenv("BT_OUTLIER_BALL_MULT", "2"))
+
+    # --- Отображение только части траектории ВЫШЕ сетки ------------------------
+    # Высота верхней ленты сетки в волейболе — 243 см (мужчины; женщины 224 см
+    # задаются через BT_NET_TOP_HEIGHT_M). Уровень сетки в пикселях вычисляется
+    # из масштаба сцены: scale_px_per_m = net_top_px / net_top_height_m. Если
+    # уровень не задан явно и автооценка невозможна (площадка/игроки не видны
+    # или их геометрия неконсистентна — например, сетки в кадре нет вовсе),
+    # ограничение НЕ применяется и рисуются все траектории целиком.
+    net_top_px: int = int(os.getenv("BT_NET_TOP_PX", "0"))          # явный уровень, px (0 → авто)
+    net_top_height_m: float = float(os.getenv("BT_NET_TOP_HEIGHT_M", "2.43"))
+    net_scale_min_px_per_m: float = float(os.getenv("BT_NET_SCALE_MIN", "50.0"))
+    net_scale_max_px_per_m: float = float(os.getenv("BT_NET_SCALE_MAX", "800.0"))
+    only_above_net: bool = os.getenv("BT_ONLY_ABOVE_NET", "1") == "1"
+
     # --- Отрисовка траекторий поверх видео -------------------------------------
     render_tracked_video: bool = os.getenv("BT_RENDER_VIDEO", "1") == "1"
     trail_length: int = int(os.getenv("BT_TRAIL_LENGTH", "25"))  # «хвост» за мячом, точек
