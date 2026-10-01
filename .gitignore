@@ -1,8 +1,1 @@
-# Python bytecode and cache
-__pycache__/
-*.pyc
-
-# Environment files
-.env
-.env.local
-.env.*
+(empty)

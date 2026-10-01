@@ -152,6 +152,18 @@ class Settings:
     # (одиночные шумы/смена направления полёта сохраняются всегда).
     min_streak: int = int(os.getenv("BT_MIN_STREAK", "2"))
     outlier_eps_px: float = float(os.getenv("BT_OUTLIER_EPS_PX", "60"))  # deprecated
+    # --- Статичный hotspot-фильтр (основной, trajectory_filter.remove_static_hotspots)
+    # На реальном видео ложные срабатывания — ЦЕПОЧКИ в одной точке фона,
+    # чередующиеся с мячом; их не брал ни eps-фильтр, ни шлюз по экстраполяции.
+    # Критерий: цепочка наблюдений удаляется, если её физически невозможно
+    # связать ни с одной соседней цепочкой (требуемая скорость стыковки >
+    # BT_MAX_BALL_SPEED_PX_F). Допуски:
+    #   BT_STATIC_RADIUS_PX — радиус «стояния на месте» (разброс hotspot'а);
+    #   BT_JUMP_TOLERANCE   — относительный допуск порога при разрыве трека.
+    static_filter_enabled: bool = os.getenv("BT_STATIC_FILTER", "1") == "1"
+    static_cell_px: float = float(os.getenv("BT_STATIC_CELL_PX", "50"))
+    static_radius_px: float = float(os.getenv("BT_STATIC_RADIUS_PX", "45"))
+    jump_tolerance: float = float(os.getenv("BT_JUMP_TOLERANCE", "0.25"))
 
     # --- Отображение только части траектории ВЫШЕ сетки ------------------------
     # Высота верхней ленты сетки — 243 см (женщины 224 см: BT_NET_TOP_HEIGHT_M).

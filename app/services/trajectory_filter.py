@@ -230,33 +230,204 @@ def remove_outliers_velocity(points: list[BallPoint], *, gate_mult: float,
     return keep, removed
 
 
+def remove_static_hotspots(points: list[BallPoint], *, cell_px: float = 50.0,
+                           radius_px: float = 45.0, min_streak: int = 2,
+                           speed_max_px_f: float = 120.0,
+                           rally_gap_frames: int = 0
+                           ) -> tuple[list[BallPoint], list[BallPoint]]:
+    """Удаление СТАТИЧНЫХ hotspot-цепочек — ложных срабатываний heatmap-детектора.
+
+    Главный урок реального видео (VID_20260925_163505.mp4): ложные детекции
+    приходят не одиночными телепортами, а ЦЕПОЧКАМИ в одной точке фона
+    (рекламный щит, мяч на полке, пятно), которые ЧЕРЕДУЮТСЯ с настоящим
+    мячом. Старый eps-фильтр («обе соседки рядом, точка — телепорт») таких
+    цепочек не видел; скоростной шлюз по экстраполяции тоже пасовал — при
+    чередовании «мяч/hotspot» прогноз строился от предыдущей hotspot-точки и
+    съедал честный полёт (регресс kept=8 из 160).
+
+    Новый критерий — физическая связность цепочки наблюдений:
+      * наблюдения склеиваются в ЦЕПОЧКИ: p_j продолжает цепочку, если
+        dist(p_{j-1}, p_j) <= max(chain_speed_limit*dt, static_radius_px)
+        (статичная группа удерживается внутри своего радиуса; движущийся мяч
+        продолжается своей согласованной скоростью);
+      * цепочка — ЛОЖЬ, если её НЕВОЗМОЖНО физически связать ни с какой
+        соседней цепочкой: минимальная требуемая скорость стыковки
+        (слева/справа по времени) > speed_max_px_f. Настоящий мяч всегда
+        «вписывается» в физику хотя бы с одним соседом; изолированная
+        статичная точка фона посреди кадра — нет;
+      * ОДИНОЧНЫЕ несогласованные точки НЕ удаляются без веской причины —
+        правило «телепорт туда-обратно»: сама точка недосяжна, а следующая
+        вернулась к предыдущей оставленной (мяч никуда не делся).
+
+    Возвращает (чищенные, выброшенные).
+    """
+    pts = sorted(points, key=lambda p: p[0])
+    n = len(pts)
+    if n < 3:
+        return pts, []
+
+    # --- 1. склейка наблюдений в когерентные цепочки ------------------------
+    # Стык ЦЕЛОСТНЫХ эпизодов (граница розыгрышей) отличается от «дыр»
+    # пропусков детекции: если между соседними наблюдениями мяч НЕ
+    # детектировался дольше rally_gap_frames, это новый эпизод — здесь трек
+    # рвётся гарантированно (иначе интерполяция через дыру рисует фантомную
+    # линию между двумя разными полётами).
+    chains: list[list[int]] = [[0]]                  # индексы pts
+    for j in range(1, n):
+        c = chains[-1]
+        last = pts[c[-1]]
+        cur = pts[j]
+        dt = max(float(cur[0] - last[0]), 1.0)
+        if rally_gap_frames and float(cur[0] - last[0]) > rally_gap_frames:
+            chains.append([j])
+            continue
+        d = math.hypot(cur[1] - last[1], cur[2] - last[2])
+        if len(c) >= 2:
+            a, b = pts[c[-2]], pts[c[-1]]
+            vprev = math.hypot(b[1] - a[1], b[2] - a[2]) / max(float(b[0] - a[0]), 1.0)
+        else:
+            vprev = 0.0
+        # статичная группа держится в своём радиусе; движущийся мяч — за
+        # согласованной скоростью (предыдущая + физический запас на ускорение)
+        limit = max(min(vprev, speed_max_px_f) * dt + radius_px,
+                    radius_px, speed_max_px_f * dt)
+        if d <= limit:
+            c.append(j)
+        else:
+            chains.append([j])
+
+    def span(ci: int) -> tuple[float, float, float, float]:
+        c = chains[ci]
+        xs = [pts[k][1] for k in c]; ys = [pts[k][2] for k in c]
+        return (min(xs), max(xs), min(ys), max(ys))
+
+    def dock_speed(ci: int, cj: int) -> float | None:
+        """Мин. средняя скорость (px/кадр) стыковки цепочки ci с cj по времени.
+
+        Дистанция — между «габаритами» (bounding boxes) цепочек: если боксы
+        пересекаются, достаточно скорости ~0 (мяч мог остаться на месте)."""
+        fi = [pts[k][0] for k in chains[ci]]
+        fj = [pts[k][0] for k in chains[cj]]
+        x0i, x1i, y0i, y1i = span(ci)
+        x0j, x1j, y0j, y1j = span(cj)
+        ex = max(x0i - x1j, x0j - x1i, 0.0)
+        ey = max(y0i - y1j, y0j - y1i, 0.0)
+        dist = math.hypot(ex, ey)
+        best = None
+        for fa in (fi[-1], fi[0]):
+            for fb in (fj[0], fj[-1]):
+                dt = abs(float(fb - fa))
+                if dt <= 0:
+                    continue
+                v = dist / dt
+                best = v if best is None or v < best else best
+        return best
+
+    # --- 2. помечаем ложью несвязуемые цепочки -------------------------------
+    # Кандидат на удаление — СТАТИЧНАЯ цепочка (все точки в пределах
+    # radius_px): настоящий мяч между контактами НЕ стоит на месте несколько
+    # кадров подряд, а heatmap-hotspot фона — стоит. Далее достаточно ЛЮБОГО
+    # физически достижимого соседа по времени (мяч мог прилететь/улететь),
+    # иначе цепочка — изолированный артефакт. Одиночные точки (len <
+    # min_streak) не судим вовсе; для очень коротких (len == min_streak == 2)
+    # требуется «телепорт туда-обратно»: сосед слева и сосед справа рядом
+    # ДРУГ С ДРУГОМ (мяч никуда не делся), но оба далеко от нас.
+    fake = [False] * len(chains)
+    for ci in range(len(chains)):
+        c = chains[ci]
+        if len(c) < min_streak:
+            continue                                # одиночные — не трогаем
+        x0, x1, y0, y1 = span(ci)
+        static = math.hypot(x1 - x0, y1 - y0) <= radius_px
+        if not static:
+            continue                                # движется — это мяч
+        f_first = pts[c[0]][0]; f_last = pts[c[-1]][0]
+        left = right = None
+        near_any = False
+        for cj in range(len(chains)):
+            if cj == ci:
+                continue
+            fj = chains[cj]
+            gj_first = pts[fj[0]][0]; gj_last = pts[fj[-1]][0]
+            v = dock_speed(ci, cj)
+            if v is None:
+                continue
+            if v <= speed_max_px_f:
+                near_any = True
+            if gj_last <= f_first:                  # cj целиком левее по времени
+                left = v if left is None or v < left else left
+            elif gj_first >= f_last:                # cj целиком правее
+                right = v if right is None or v < right else right
+        anchors = [v for v in (left, right) if v is not None]
+        if not anchors:
+            isolated = False                        # вне кадра — не судим
+        else:
+            isolated = not near_any
+        # сверхстрогое правило для самых коротких статичных цепочек: соседи
+        # рядом друг с другом (мяч продолжал полёт рядом), а мы — всплеск
+        if isolated and len(c) <= 2:
+            nb = [(dock_speed(ci, cj), cj) for cj in range(len(chains))
+                  if cj != ci]
+            nb = [(v, cj) for v, cj in nb if v is not None]
+            pair_ok = False
+            for (va, ca), (vb, cb) in zip(nb, nb[1:]):
+                da, db = span(ca), span(cb)
+                gap = math.hypot(max(da[0] - db[1], db[0] - da[1], 0.0),
+                                 max(da[2] - db[3], db[2] - da[3], 0.0))
+                fa_ = pts[chains[ca][-1]][0]; fb_ = pts[chains[cb][0]][0]
+                dt_ = max(abs(float(fb_ - fa_)), 1.0)
+                if gap / dt_ <= speed_max_px_f and va > speed_max_px_f \
+                        and vb > speed_max_px_f:
+                    pair_ok = True
+            isolated = pair_ok
+        if isolated:
+            fake[ci] = True
+    keep = [pts[k] for ci, c in enumerate(chains) if not fake[ci] for k in c]
+    removed = [pts[k] for ci, c in enumerate(chains) if fake[ci] for k in c]
+    return sorted(keep, key=lambda p: p[0]), sorted(removed, key=lambda p: p[0])
+
+
 def split_track_by_jumps(points: list[BallPoint], speed_max_px_f: float,
-                         rally_gap_frames: int = 0
+                         rally_gap_frames: int = 0, jump_tolerance: float = 0.25
                          ) -> tuple[list[BallPoint], int]:
     """Разрезает трек на розыгрыши по физической границе скорости мяча.
 
-    Разрыв ставится только там, где СРЕДНЯЯ скорость между соседними
-    оставленными точками (dist/dt в px/КАДР, dt — разница номеров кадров)
-    превышает speed_max_px_f — т.е. шаг физически невозможен даже для
-    самого быстрого удара; ЛИБО разрыв в кадрах больше rally_gap_frames
-    (мяч не детектировался дольше окна розыгрыша — граница эпизода даже
-    если точки стоят рядом). Раньше резали по простому расстоянию > eps:
-    на быстром полёте каждый кадр даёт шаг > eps и трек рассыпался на
-    микро-осколки короче par_min_frames (flights=[]). Теперь обычный
-    пас/атака (шаг 20–80 px/кадр) остаётся цельным, а рвутся только
+    ВАЖНО (главный баг прошлой версии): разрыв ищем ТОЛЬКО по РЕАЛЬНЫМ
+    наблюдениям — парам соседних точек с dt == 1 кадр. Линейно
+    интерполированные точки (после _interp_track) образуют «мосты», у которых
+    фиктивные концевые точки всегда имеют dt == 1 и мгновенную скорость,
+    равную средней на всём пролёте моста. На реальном видео это убивало
+    трек: длинный честный перелёт (например, frames 12→25 через ~1400 px)
+    давал на конце моста ~95 px/кадр, следующий за ним короткий шаг
+    (25→26, ~7 px) формально превышал порог 90*1.2 — трек рвался посреди
+    одного полёта на десятки микро-осколков (< par_min_frames), и API
+    возвращал flights=[]. Поэтому теперь:
+      * пары с dt != 1 (вершина «моста») пропускаются — там мгновенная
+        скорость неопределима;
+      * разрыв ставится, если dist/dt > speed_max_px_f * jump_tolerance
+        (допуск на шум/ускорение) для REAL-пары;
+      * ЛИБО разрыв в кадрах > rally_gap_frames (мяч не детектировался
+        дольше окна розыгрыша — граница эпизода, даже если точки рядом).
+    Обычный пас/атака (шаг 20–80 px/кадр) остаётся цельным; рвутся только
     настоящие склейки разных эпизодов (teleport через весь кадр).
     Возвращает (ПЕРВЫЙ кусок до разрыва, 1) либо (весь трек, 0).
     """
     if len(points) < 2 or speed_max_px_f <= 0:
         return sorted(points, key=lambda p: p[0]), 0
     pts = sorted(points, key=lambda p: p[0])
+    tol = 1.0 + max(jump_tolerance, 0.0)
     for i in range(len(pts) - 1):
         a, b = pts[i], pts[i + 1]
-        dt = max(float(b[0] - a[0]), 1.0)
+        dt = float(b[0] - a[0])
+        # кадр-разрыв эпизода — граница розыгрыша даже при малом смещении
         if rally_gap_frames and dt > rally_gap_frames:
             return pts[:i + 1], 1
-        if math.hypot(b[1] - a[1], b[2] - a[2]) / dt > speed_max_px_f:
-            return pts[:i + 1], 1
+        # мгновенную скорость проверяем ТОЛЬКО на реальных соседних кадрах
+        # (dt == 1); вершины интерполяционных «мостов» (dt != 1) пропускаем,
+        # иначе длинный перелёт рвётся посреди честного полёта (см. docstring)
+        if dt == 1.0:
+            if math.hypot(b[1] - a[1], b[2] - a[2]) > speed_max_px_f * tol:
+                return pts[:i + 1], 1
     return pts, 0
 
 
