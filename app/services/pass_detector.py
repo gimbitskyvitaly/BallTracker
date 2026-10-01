@@ -170,6 +170,76 @@ def find_parabolic_segments(points: list[tuple[int, float, float]], fps: float,
     return segments
 
 
+def raw_fit_diagnostics(points: list[tuple[int, float, float]], fps: float,
+                        *, min_frames: int, max_frames: int, gap_break: int,
+                        gravity_px_s2: float, grav_tol_rel: float,
+                        max_rmse_frac: float, frame_small: int,
+                        frame_width: int,
+                        min_horizontal_disp_frac: float) -> list[dict]:
+    """Диагностика для режима render_mode="full": НЕПРЕРЫВНЫЕ LSQ-фиты без фильтров.
+
+    Гипотеза «пас почти не детектится, потому что баллистическая траектория не
+    находится» проверяется так: тем же жадным алгоритмом, но ОТСЮДА выбрасы-
+    ваются гравитационный/RMSE/дисперсионный фильтры — окно принимается как
+    «баллистический кандидат», если LSQ-фит вообще сошёлся (>=4 точек, без
+    разрывов наблюдений). Для каждого кандидата сохраняются реальные значения
+    всех отброшенных критериев (ay/g, rmse/min(H,W), disp/W, какая именно про-
+    верка завалила бы его в обычном режиме) — это позволяет увидеть, ДЕЙСТВИ-
+    ТЕЛЬНО ли фит не находится и по какой причине он отсекается фильтрами.
+    """
+    if len(points) < min_frames:
+        return []
+    pts = sorted(points, key=lambda p: p[0])
+    out: list[dict] = []
+    i, n = 0, len(pts)
+    while i < n:
+        placed = False
+        for j in range(min(n - 1, i + max_frames), i + min_frames - 1, -1):
+            f = np.array([p[0] for p in pts[i:j + 1]], float)
+            x = np.array([p[1] for p in pts[i:j + 1]], float)
+            y = np.array([p[2] for p in pts[i:j + 1]], float)
+            if len(f) > 1 and int(np.max(np.diff(f))) > gap_break:
+                continue
+            fit = _fit_ballistic(f, x, y, fps)
+            if fit is None:
+                continue
+            seg_pts = pts[i:j + 1]
+            direction, ratio = classify_direction(seg_pts, frame_width)
+            disp_px = abs(float(x[-1] - x[0]))
+            rmse_frac = fit["rmse_px"] / max(frame_small, 1e-6)
+            grav_ok = abs(fit["ay"] - gravity_px_s2) <= grav_tol_rel * gravity_px_s2
+            fails = []
+            if rmse_frac > max_rmse_frac:
+                fails.append("rmse")
+            if not grav_ok:
+                fails.append("gravity")
+            if disp_px < min_horizontal_disp_frac * frame_width:
+                fails.append("disp")
+            out.append({
+                "start_frame": int(f[0]), "end_frame": int(f[-1]),
+                "points": [(int(a), float(b), float(c)) for a, b, c in seg_pts],
+                "vx_px_s": round(fit["vx"], 2), "vy0_px_s": round(fit["vy0"], 2),
+                "ay_px_s2": round(fit["ay"], 2),
+                "g_ref_px_s2": round(gravity_px_s2, 2),
+                "grav_err_rel": round(abs(fit["ay"] - gravity_px_s2)
+                                      / max(gravity_px_s2, 1e-9), 3),
+                "rmse_px": round(fit["rmse_px"], 2),
+                "rmse_frac": round(rmse_frac, 4),
+                "disp_px": round(disp_px, 1),
+                "disp_frac": round(disp_px / max(frame_width, 1e-6), 4),
+                "apex_y_px": round(fit["apex_y_px"], 1),
+                "direction": direction, "to_net_ratio": round(ratio, 3),
+                "would_pass_filters": not fails,
+                "failed_checks": fails,
+            })
+            i = j + 1
+            placed = True
+            break
+        if not placed:
+            i += 1
+    return out
+
+
 def classify_direction(seg_pts: list[tuple[int, float, float]],
                        frame_width: int) -> tuple[str, float]:
     """Направление участка относительно сетки (центр кадра = проекция сетки).

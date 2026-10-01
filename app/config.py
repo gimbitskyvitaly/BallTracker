@@ -121,6 +121,12 @@ class Settings:
     render_tracked_video: bool = os.getenv("BT_RENDER_VIDEO", "1") == "1"
     trail_length: int = int(os.getenv("BT_TRAIL_LENGTH", "25"))  # «хвост» за мячом, точек
     render_dir: str = os.getenv("BT_RENDER_DIR", "data/renders")
+    # Режим отрисовки (диагностика гипотезы «баллистический фит не находится»):
+    #   "passes" — рисовать только траектории найденных пасов (по умолчанию);
+    #   "full"   — рисовать ПОЛНУЮ траекторию мяча (весь трек по всем розыгрышам)
+    #              ДО поиска параболических участков + все баллистические сег-
+    #              менты (и пасы «к сетке», и «от сетки») с их RMSE/grav-метками.
+    render_mode: str = os.getenv("BT_RENDER_MODE", "passes")
 
     # --- Хранилище ------------------------------------------------------------
     db_path: str = os.getenv("BT_DB_PATH", "data/balltime.db")

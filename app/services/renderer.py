@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import traceback
 from collections import deque
 
 import cv2
@@ -213,16 +214,138 @@ def _build_overlays(analysis) -> list[FlightOverlay]:
     return overlays
 
 
+def _draw_full_trajectory(frame: np.ndarray, analysis, fid: int,
+                          ball_r: int, trail_length: int) -> None:
+    """render_mode="full": полная траектория мяча ДО поиска параболических участков.
+
+    Рисуется (для проверки гипотезы «баллистический фит не находится»):
+      * линия сетки (центр кадра) — ориентир направления пасов;
+      * ВСЕ точки трека мяча: уже пройденные — сплошная белая полилиния + точ-
+        ки, текущая позиция — жёлтый маркер с хвостом; ещё не пройденные —
+        тусклый пунктир (видно форму всей траектории заранее);
+      * границы розыгрышей RALLY#k (по analysis.rallies);
+      * баллистические LSQ-фиты БЕЗ фильтров из analysis.fit_diagnostics:
+        зелёный = прошёл бы все фильтры (кандидат в пасы), красный = завалил
+        фильтр (подпись FAIL:gravity/rmse/disp), голубой = direction away
+        (летит от сетки); поверх фита рисуется его парабола-фит и подписи
+        g_fit/g_ref, rmse_frac;
+      * найденные пасы (analysis.passes) — как обычно, через draw_flight;
+      * HUD: кадры/трек/покрытие трека баллистическими фитами (coverage).
+    """
+    h_img, w_img = frame.shape[:2]
+    track = [(p["frame"], p["x"], p["y"]) for p in analysis.ball_track_points]
+    if not track:
+        return
+
+    # --- линия сетки -----------------------------------------------------------
+    net_x = int(w_img / 2)
+    cv2.line(frame, (net_x, 0), (net_x, h_img - 1), (255, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(frame, "NET", (net_x + 4, 16), cv2.FONT_HERSHEY_SIMPLEX,
+                0.45, (255, 255, 0), 1, cv2.LINE_AA)
+
+    # --- непройденная часть: тусклый пунктир ----------------------------------
+    future = [(f, x, y) for f, x, y in track if f > fid]
+    for i in range(0, len(future) - 1, 2):          # каждый второй сегмент → пунктир
+        p0, p1 = future[i], future[i + 1]
+        cv2.line(frame, (int(p0[1]), int(p0[2])), (int(p1[1]), int(p1[2])),
+                 (90, 90, 90), 1, cv2.LINE_AA)
+
+    # --- пройденная часть: сплошная полилиния + точки --------------------------
+    past = [(f, x, y) for f, x, y in track if f <= fid][-400:]   # окно памяти кадра
+    if len(past) >= 2:
+        pts_np = np.array([(int(x), int(y)) for _, x, y in past], np.int32)
+        cv2.polylines(frame, [pts_np.reshape(-1, 1, 2)], False,
+                      (235, 235, 235), 1, cv2.LINE_AA)
+    for f, x, y in past[::max(1, len(past) // 60)]:
+        cv2.circle(frame, (int(x), int(y)), 1, (200, 200, 200), -1, cv2.LINE_AA)
+
+    # --- текущая позиция мяча + короткий хвост --------------------------------
+    cur = next(((f, x, y) for f, x, y in reversed(past) if f == fid), None)
+    if cur is not None:
+        tail = past[-trail_length // 3:]
+        for i in range(len(tail) - 1):
+            t = (i + 1) / max(len(tail) - 1, 1)
+            col = tuple(int(c * t) for c in (0, 220, 255))
+            cv2.line(frame, (int(tail[i][1]), int(tail[i][2])),
+                     (int(tail[i + 1][1]), int(tail[i + 1][2])), col, 2, cv2.LINE_AA)
+        cv2.drawMarker(frame, (int(cur[1]), int(cur[2])), (0, 220, 255),
+                       cv2.MARKER_TILTED_CROSS, 12, 2, cv2.LINE_AA)
+
+    # --- границы розыгрышей -----------------------------------------------------
+    for ri, r in enumerate(getattr(analysis, "rallies", []) or []):
+        if r.start_frame <= fid <= r.end_frame + 12:
+            x0, y0 = 8, h_img - 12 - ri * 18
+            cv2.putText(frame, f"RALLY#{ri + 1} [{r.start_frame}-{r.end_frame}]",
+                        (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (180, 180, 180), 1, cv2.LINE_AA)
+
+    # --- баллистические фиты без фильтров ---------------------------------------
+    diag = getattr(analysis, "fit_diagnostics", None) or {}
+    fits = diag.get("fits", [])
+    for ft in fits:
+        if ft["start_frame"] > fid or ft["end_frame"] < fid - 30:
+            continue                                   # рисуем вокруг окна фита
+        pts = ft["points"]
+        ok = ft["would_pass_filters"]
+        away = ft["direction"] == "away"
+        col = (80, 220, 80) if ok else ((120, 120, 255) if away else (60, 60, 255))
+        seg = np.array([(int(x), int(y)) for _, x, y in pts], np.int32)
+        cv2.polylines(frame, [seg.reshape(-1, 1, 2)], False, col, 2, cv2.LINE_AA)
+        mx = int(pts[len(pts) // 2][1])
+        my = int(pts[len(pts) // 2][2]) - 14
+        tag = ("FIT OK" if ok else "FAIL:" + ",".join(ft["failed_checks"]))
+        if away:
+            tag += " AWAY"
+        lab = f"#{ft['fit_index']} {tag} g={ft['grav_err_rel']:.2f} rmse={ft['rmse_frac']:.3f}"
+        cv2.putText(frame, lab, (mx - 40, my), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4, col, 1, cv2.LINE_AA)
+
+    # --- найденные пасы (как в обычном режиме) ----------------------------------
+    overlays = _build_overlays(analysis)
+    for o in overlays:
+        if o.active(fid, 12):
+            try:
+                draw_flight(frame, o, ball_r, trail_length, fid,
+                            hold_left=max(0, fid - o.catch_frame))
+            except Exception:  # noqa: BLE001
+                pass
+
+    # --- HUD --------------------------------------------------------------------
+    cov = diag.get("coverage_px", {})
+    lines = [
+        f"MODE FULL  f{fid}/{analysis.n_frames}",
+        f"track={len(track)} ({analysis.detection_rate:.0%}) rallies={len(analysis.rallies)}",
+        f"raw fits={diag.get('total_raw_fits', 0)} pass-filters={diag.get('total_would_pass', 0)}"
+        f" passes={len(analysis.passes)}",
+        f"ballistic coverage={cov.get('coverage', 0):.0%}",
+    ]
+    bw, bh = min(330, max(40, w_img - 20)), 4 * 20 + 12
+    cv2.rectangle(frame, (10, 10), (10 + bw, 10 + bh), (0, 0, 0), -1)
+    roi = frame[10:10 + bh, 10:10 + bw]
+    cv2.addWeighted(roi.copy(), 0.55, frame[10:10 + bh, 10:10 + bw], 0.45, 0,
+                    frame[10:10 + bh, 10:10 + bw])
+    for li, text in enumerate(lines):
+        cv2.putText(frame, text, (18, 10 + 18 + li * 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
+
+
 def render_tracked_video(src_path: str, dst_path: str, analysis,
                          trail_length: int | None = None,
-                         tail_hold_frames: int = 24) -> str:
-    """Основной вход: исходное видео + VideoAnalysis → видео с траекториями пасов.
+                         tail_hold_frames: int = 24,
+                         mode: str | None = None) -> str:
+    """Основной вход: исходное видео + VideoAnalysis → видео с траекториями.
+
+    mode=None → settings.render_mode:
+      "passes" — рисовать только траектории найденных пасов;
+      "full"   — рисовать ПОЛНУЮ траекторию мяча до поиска параболических
+                 участков + все баллистические фиты без фильтров (диагностика).
 
     Возвращает путь к результату. Покадрово сохраняет исходные кадры, поверх
     рисует активные(ый) пас(ы); завершённые пасы остаются «эхом» ещё
     tail_hold_frames кадров. Кадры вне всех полётов остаются чистыми.
     """
     trail_length = trail_length or settings.trail_length
+    mode = (mode or settings.render_mode or "passes").lower()
     cap = cv2.VideoCapture(src_path)
     if not cap.isOpened():
         raise ValueError(f"Не удалось открыть видео: {src_path}")
@@ -230,7 +353,7 @@ def render_tracked_video(src_path: str, dst_path: str, analysis,
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    overlays = _build_overlays(analysis)
+    overlays = [] if mode == "full" else _build_overlays(analysis)
     os.makedirs(os.path.dirname(dst_path) or ".", exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(dst_path, fourcc, fps, (w, h))
@@ -244,14 +367,20 @@ def render_tracked_video(src_path: str, dst_path: str, analysis,
         if not ok:
             break
         fid += 1
-        for o in overlays:
-            if not o.active(fid, tail_hold_frames):
-                continue
+        if mode == "full":
             try:
-                draw_flight(frame, o, ball_r, trail_length, fid,
-                            hold_left=max(0, fid - o.catch_frame))
+                _draw_full_trajectory(frame, analysis, fid, ball_r, trail_length)
             except Exception:  # noqa: BLE001 — рендер не должен валить job
-                pass
+                traceback.print_exc()
+        else:
+            for o in overlays:
+                if not o.active(fid, tail_hold_frames):
+                    continue
+                try:
+                    draw_flight(frame, o, ball_r, trail_length, fid,
+                                hold_left=max(0, fid - o.catch_frame))
+                except Exception:  # noqa: BLE001 — рендер не должен валить job
+                    pass
         out.write(frame)
     cap.release()
     out.release()

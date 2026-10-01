@@ -33,7 +33,8 @@ import cv2
 import numpy as np
 
 from app.config import settings
-from app.services.pass_detector import Rally, detect_passes
+from app.services.pass_detector import (Rally, detect_passes,
+                                         raw_fit_diagnostics)
 from app.services.physics import estimate_flight, set_gravity_px
 from app.services.vballnet import VballNetDetector
 
@@ -61,6 +62,10 @@ class VideoAnalysis:
     passes: list[PassEvent] = field(default_factory=list)
     ball_radius_px: float = 6.0
     detection_rate: float = 0.0         # доля кадров с детекцией мяча
+    # диагностика режима render_mode="full": баллистические LSQ-фитЫ БЕЗ
+    # фильтров (rmse/gravity/disp) по каждому розыгрышу + границы розыгрышей;
+    # None в обычном режиме "passes"
+    fit_diagnostics: dict | None = None
 
 
 _detector_singleton: VballNetDetector | None = None
@@ -186,9 +191,66 @@ def analyze_video(path: str, detector: VballNetDetector | None = None,
             direction=ps.direction, to_net_ratio=round(ps.segment.to_net_ratio, 3),
             rmse_px=round(ps.segment.rmse_px, 2), points_px=pts, flight=flight,
             rally_index=rally_of(ps.release_frame)))
+
+    # --- диагностика для render_mode="full": фиты БЕЗ фильтров ---------------
+    if settings.render_mode == "full":
+        from app.services.pass_detector import split_rallies
+        diag_rallies = []
+        all_fits: list[dict] = []
+        for ri, rp in enumerate(split_rallies(track, settings.rally_gap_frames)):
+            fits = raw_fit_diagnostics(
+                rp, fps,
+                min_frames=settings.par_min_frames,
+                max_frames=settings.par_max_frames,
+                gap_break=settings.rally_gap_frames,
+                gravity_px_s2=fps * fps * settings.gravity_fit_ratio,
+                grav_tol_rel=settings.grav_tol_rel,
+                max_rmse_frac=settings.par_max_rmse_frac,
+                frame_small=min(width, height), frame_width=width,
+                min_horizontal_disp_frac=settings.min_horizontal_disp_frac)
+            for k, ft in enumerate(fits):
+                ft["rally_index"] = ri
+                ft["fit_index"] = len(all_fits)
+                all_fits.append(ft)
+            diag_rallies.append({"index": ri,
+                                 "start_frame": rp[0][0], "end_frame": rp[-1][0],
+                                 "n_points": len(rp),
+                                 "n_raw_fits": len(fits),
+                                 "n_would_pass": sum(f["would_pass_filters"]
+                                                     for f in fits)})
+        n_would = sum(f["would_pass_filters"] for f in all_fits)
+        analysis.fit_diagnostics = {
+            "render_mode": "full",
+            "note": ("LSQ-фиты баллистики без фильтров rmse/gravity/disp; "
+                     "failed_checks показывает, какой фильтр отсек бы участок"),
+            "total_raw_fits": len(all_fits),
+            "total_would_pass": n_would,
+            "coverage_px": _fit_coverage_px(all_fits, track),
+            "rallies": diag_rallies,
+            "fits": [{**f, "points": [[int(a), round(b, 1), round(c, 1)]
+                                      for a, b, c in f["points"]]}
+                     for f in all_fits],
+        }
     if progress_cb:
         progress_cb(frames_read, total)
     return analysis
+
+
+def _fit_coverage_px(fits: list[dict], track: list[tuple[int, float, float]]) -> dict:
+    """Какую часть трека мяча «объясняют» баллистические фиты без фильтров.
+
+    Если coverage низкий — гипотеза верна: траектория между контактами вообще
+    не описывается кусками парабол (шум детекции/окно фита), и дело не в по-
+    рогах фильтрации пасов."""
+    covered = set()
+    for f in fits:
+        for p in f["points"]:
+            covered.add(int(p[0]))
+    frames_in_track = {int(t[0]) for t in track}
+    cov = len(covered & frames_in_track) / max(len(frames_in_track), 1)
+    return {"track_frames": len(frames_in_track),
+            "ballistic_frames": len(covered & frames_in_track),
+            "coverage": round(cov, 3)}
 
 
 def save_analysis(analysis: "VideoAnalysis", path: str) -> None:

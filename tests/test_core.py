@@ -284,6 +284,134 @@ class TestRenderer:
         assert _point_at_time(pts, 0.5) is None
         assert _point_at_time(pts, 3.0) == (20.0, 10.0)
 
+    # ---------------- флаг render_mode: "passes" | "full" -------------------
+    def _make_full_analysis(self):
+        """Анализ с длинным треком (ведение + пас «к сетке» + полёт «от сетки»)
+        и готовым fit_diagnostics для режима full."""
+        from app.services.pipeline import VideoAnalysis
+        from app.services.pass_detector import raw_fit_diagnostics
+        an, _ = self._make_analysis()
+        carry = [(f, 80.0 + 0.4 * f, 380.0 + 6 * np.sin(f / 4)) for f in range(1, 31)]
+        away = _flight_points(71, 120, 250, vx=+240, vy0=-260, n=30)
+        track = sorted(carry + [(p["frame"], p["x"], p["y"])
+                                for p in an.ball_track_points] + away)
+        an.ball_track_points = [{"frame": int(f), "x": float(x), "y": float(y)}
+                                for f, x, y in track]
+        an.n_frames = 140
+        fits = raw_fit_diagnostics([(p["frame"], p["x"], p["y"]) for p in an.ball_track_points],
+                                   FPS, min_frames=settings.par_min_frames,
+                                   max_frames=settings.par_max_frames,
+                                   gap_break=settings.rally_gap_frames,
+                                   gravity_px_s2=G_PX_S2,
+                                   grav_tol_rel=settings.grav_tol_rel,
+                                   max_rmse_frac=settings.par_max_rmse_frac,
+                                   frame_small=min(W, H), frame_width=W,
+                                   min_horizontal_disp_frac=settings.min_horizontal_disp_frac)
+        for i, ft in enumerate(fits):
+            ft["fit_index"] = i
+        an.fit_diagnostics = {"render_mode": "full", "total_raw_fits": len(fits),
+                              "total_would_pass": sum(f["would_pass_filters"] for f in fits),
+                              "coverage_px": {"track_frames": len(track),
+                                              "ballistic_frames": 0, "coverage": 0.5},
+                              "rallies": [], "fits": fits}
+        return an
+
+    def test_raw_fit_diagnostics_no_filters(self):
+        """Фиты без фильтров находятся даже там, где фильтры пасов их отсекают
+        (проверка гипотезы: баллистический участок есть, но не проходит пороги)."""
+        from app.services.pass_detector import raw_fit_diagnostics
+        # дуга с завышенным ускорением (завалит gravity-фильтр) — в обычном
+        # поиске сегментов её нет, в диагностике — есть и помечена failed_checks
+        bad_g = [(f, 100.0 + 200 * (f - 1) / FPS,
+                  300.0 - 300 * (f - 1) / FPS + 0.5 * G_PX_S2 * 3.0 * ((f - 1) / FPS) ** 2)
+                 for f in range(1, 26)]
+        segs = find_parabolic_segments(bad_g, FPS,
+                                       min_frames=settings.par_min_frames,
+                                       max_frames=settings.par_max_frames,
+                                       max_rmse_frac=settings.par_max_rmse_frac,
+                                       gravity_px_s2=G_PX_S2,
+                                       grav_tol_rel=settings.grav_tol_rel,
+                                       gap_break=15,
+                                       min_horizontal_disp_frac=settings.min_horizontal_disp_frac,
+                                       frame_small=min(W, H), frame_width=W)
+        diag = raw_fit_diagnostics(bad_g, FPS,
+                                   min_frames=settings.par_min_frames,
+                                   max_frames=settings.par_max_frames,
+                                   gap_break=15, gravity_px_s2=G_PX_S2,
+                                   grav_tol_rel=settings.grav_tol_rel,
+                                   max_rmse_frac=settings.par_max_rmse_frac,
+                                   frame_small=min(W, H), frame_width=W,
+                                   min_horizontal_disp_frac=settings.min_horizontal_disp_frac)
+        assert segs == [], "участок с ay≈3g не должен проходить гравитационный фильтр"
+        assert len(diag) >= 1, "без фильтров кандидат находиться обязан"
+        assert any("gravity" in d["failed_checks"] for d in diag)
+
+    def test_render_mode_full_draws_whole_track(self, tmp_path):
+        """В режиме full траектория рисуется ВО ВСЕХ кадрах с мячом (до поиска
+        параболических участков), а не только в окнах пасов."""
+        import cv2, os
+        from app.services.renderer import render_tracked_video
+        src = str(tmp_path / "in.mp4"); dst = str(tmp_path / "out_full.mp4")
+        rng = np.random.default_rng(7)
+        vw = cv2.VideoWriter(src, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
+        for i in range(140):
+            base = np.full((H, W, 3), 60, np.uint8)
+            noise = rng.integers(0, 25, (H, W, 1), dtype=np.uint8)
+            vw.write(np.clip(base + noise, 0, 255).astype(np.uint8))
+        vw.release()
+        an = self._make_full_analysis()
+        out = render_tracked_video(src, dst, an, mode="full")
+        assert os.path.exists(out) and os.path.getsize(out) > 0
+
+        ca, cb = cv2.VideoCapture(src), cv2.VideoCapture(dst)
+        marked_frames = 0; total = 0
+        while True:
+            oka, fa = ca.read(); okb, fb = cb.read()
+            if not (oka and okb):
+                break
+            total += 1
+            diff = np.abs(fa.astype(np.int16) - fb.astype(np.int16)).max(axis=2)
+            if int((diff > 40).sum()) > 100:
+                marked_frames += 1
+        ca.release(); cb.release()
+        assert total == 140
+        # режим passes красит ~40 кадров полёта; full — весь трек (1..100) + HUD всегда
+        assert marked_frames > 90, ("full-режим должен рисовать полную траекторию, "
+                                    f"закрашено кадров: {marked_frames}")
+
+    def test_render_mode_passes_only_pass_windows(self, tmp_path):
+        """Режим passes (по умолчанию) остаётся прежним: чистые кадры вне пасов."""
+        import cv2
+        from app.services.renderer import render_tracked_video
+        src = str(tmp_path / "in.mp4"); dst = str(tmp_path / "out_passes.mp4")
+        rng = np.random.default_rng(7)
+        vw = cv2.VideoWriter(src, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
+        for i in range(140):
+            base = np.full((H, W, 3), 60, np.uint8)
+            noise = rng.integers(0, 25, (H, W, 1), dtype=np.uint8)
+            vw.write(np.clip(base + noise, 0, 255).astype(np.uint8))
+        vw.release()
+        an = self._make_full_analysis()
+        render_tracked_video(src, dst, an, mode="passes", tail_hold_frames=24)
+        ca, cb = cv2.VideoCapture(src), cv2.VideoCapture(dst)
+        clean_outside = True
+        n = 0
+        while True:
+            oka, fa = ca.read(); okb, fb = cb.read()
+            if not (oka and okb):
+                break
+            n += 1
+            if n < 31 or n > 95:      # вне паса и хвоста удержания
+                diff = np.abs(fa.astype(np.int16) - fb.astype(np.int16)).max(axis=2)
+                if int((diff > 40).sum()) > 200:
+                    clean_outside = False
+        ca.release(); cb.release()
+        assert clean_outside, "в режиме passes кадры вне пасов должны быть чистыми"
+
+    def test_render_mode_setting_default_passes(self):
+        from app.config import settings as s
+        assert s.render_mode in ("passes", "full")
+
 
 class TestPipelineTrackBuilding:
     def test_interp_track_closes_small_gaps(self):

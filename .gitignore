@@ -1,14 +1,1 @@
-# Python compiled files
-__pycache__/
-*.pyc
-
-# Environment and IDE
-.env
-.vscode/
-# Runtime artifacts
-data/renders/
-data/uploads/
-data/*.db
-.pytest_cache/
-__pycache__/
-*.pyc
+(empty)
