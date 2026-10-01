@@ -1,10 +1,12 @@
-"""Интеграционные тесты API (FastAPI TestClient) с мок-детектором.
+"""Интеграционные тесты API (FastAPI TestClient) с mock-детектором VballNet.
 
-Реальный YOLO на синтетике не детектирует круг-мяч, поэтому в pipeline
-подставляется mock-класс BallDetector, возвращающий детерминированные
-детекции мяча и двух «игроков». Так проверяются все слои: загрузка видео →
-фон job → трекинг → события паса → физика → SQLite → JSON API.
+Реальная ONNX-модель на синтетике не нужна (и тяжела для CI): в pipeline
+подставляется заглушка, возвращающая детерминированные позиции мяча —
+баллистические полёты К сетке (пасы) и «ведение» мяча (не пас). Так
+проверяются все слои: загрузка видео → job → трек/розыгрыши → события
+пасов → физика → SQLite → JSON API → рендер видео с траекториями.
 """
+import math
 import os
 import time
 
@@ -16,61 +18,59 @@ os.environ.setdefault("BT_DB_PATH", "data/test_balltime.db")
 os.environ.setdefault("BT_UPLOAD_DIR", "data/test_uploads")
 
 from app.config import settings  # noqa: E402
-from app.services.detector import Detection  # noqa: E402
+from app.services.vballnet import BallPoint  # noqa: E402
 
-
-# --- мок-детектор: аналитическая парабола мяча + два rect-«игрока» ---------
 FPS = 30.0
-HOLD1 = int(FPS * 1.0)
-FLIGHT = int(FPS * 2.5)
-X0, Y0 = 140.0, 300.0
-X1, Y1 = 500.0, 320.0
-APEX = 140.0
-G = settings.gravity_ratio * FPS * FPS
+W, H = 640, 480
+G_PX_S2 = FPS * FPS * 0.55
+
+# Сцена: розыгрыш 1 — пас ВЛЕВО к сетке (кадры 0..26), затем «ведение» (не пас);
+#         розыгрыш 2 — пас ВПРАВО к сетке (кадры 90..115).
+PASS1 = [(i, 520.0 - 280 * i / FPS,
+          320.0 - 320 * i / FPS + 0.5 * G_PX_S2 * (i / FPS) ** 2)
+         for i in range(27)]
+CARRY = [(30 + i, 150.0 + 2.0 * i, 380.0 + 0.5 * i) for i in range(55)]
+# y считается от начала полёта (i-90): иначе парабола улетает за кадр и
+# трек обрывается интерполяцией на границе видео.
+PASS2 = [(i, 120.0 + 280 * (i - 90) / FPS,
+          320.0 - 320 * (i - 90) / FPS + 0.5 * G_PX_S2 * ((i - 90) / FPS) ** 2)
+         for i in range(90, 116)]
+SCENE = {f: (x, y) for f, x, y in PASS1 + CARRY + PASS2}
 
 
-def ball_pos(i: int):
-    if i < HOLD1:
-        return X0, Y0
-    if i < HOLD1 + FLIGHT:
-        t = (i - HOLD1) / FLIGHT
-        x = X0 + (X1 - X0) * t
-        y = (1 - t) ** 2 * Y0 + 2 * (1 - t) * t * APEX + t ** 2 * Y1
-        return x, y
-    return X1, Y1
+class MockVballNet:
+    """Заглушка VballNetDetector.feed: окно кадров -> точки мяча по расписанию."""
 
+    def __init__(self, scene=SCENE):
+        self.scene = scene
 
-class MockDetector:
-    def __init__(self):
-        self.frame = 0
-
-    def detect(self, frame):
-        self.frame += 1
-        i = self.frame - 1
-        bx, by = ball_pos(i)
-        r = 14.0
-        balls = [Detection(bbox=np.array([bx - r, by - r, bx + r, by + r]), conf=0.9, cls=32)]
-        persons = [
-            Detection(bbox=np.array([X0 - 30, Y0 - 90, X0 + 30, Y0 + 90]), conf=0.9, cls=0),
-            Detection(bbox=np.array([X1 - 30, Y1 - 90, X1 + 30, Y1 + 90]), conf=0.9, cls=0),
-        ]
-        return balls, persons
+    def feed(self, frames, start_idx=0):
+        out = []
+        for i in range(len(frames)):
+            fr = start_idx + i                # 0-based номера кадров сцены
+            if fr in self.scene:
+                x, y = self.scene[fr]
+                out.append(BallPoint(frame=fr, x=x, y=y, conf=0.9))
+            else:
+                out.append(None)
+        return out
 
 
 @pytest.fixture(scope="module")
 def client(tmp_path_factory):
     import app.main as main
-    main._detector = MockDetector()   # подменяем singleton до первого запроса
+    main.get_detector = lambda: MockVballNet()   # mock до первого запроса
     dbf = str(tmp_path_factory.mktemp("db") / "t.db")
     settings.db_path = dbf
     settings.upload_dir = str(tmp_path_factory.mktemp("up"))
+    settings.render_dir = str(tmp_path_factory.mktemp("renders"))
     from app.services import storage
     storage.init_db()
     with TestClient(main.app) as c:
         yield c
 
 
-def _wait_done(client, jid, timeout=60):
+def _wait_done(client, jid, timeout=90):
     deadline = time.time() + timeout
     while time.time() < deadline:
         j = client.get(f"/api/v1/jobs/{jid}").json()
@@ -96,19 +96,40 @@ def test_full_pipeline(client):
     assert j["fps"] == pytest.approx(FPS, abs=1)
 
     passes = client.get(f"/api/v1/passes/{jid}").json()
-    assert len(passes) >= 1, "должно быть обнаружено минимум одно событие паса"
+    # ровно два паса: ведение мяча (без баллистики) пасом считаться не должно
+    assert len(passes) == 2, f"ожидалось 2 паса, получено {len(passes)}"
     p = passes[0]
-    # ожидаемое время полёта ~2.5 c (релиз на ~кадре 30, приёмка ~105)
-    assert 1.8 <= p["time_of_flight_s"] <= 3.2, p
+    tof_expected = (p["catch_frame"] - p["release_frame"]) / FPS
+    assert abs(p["time_of_flight_s"] - tof_expected) < 0.1
     assert p["method"] in ("physics_fit", "tracked_direct")
-    assert p["apex_height_m"] > 0.5
+    assert p["apex_height_m"] > 0.3
     assert p["distance_m"] > 1.0
     assert p["initial_speed_mps"] > 0.5
+    # направление: первый пас летит влево к сетке, второй — вправо
+    assert p["direction"] == "left"
+    assert passes[1]["direction"] == "right"
+    assert p["to_net_ratio"] < 0.85 and passes[1]["to_net_ratio"] < 0.85
+
     traj = client.get(f"/api/v1/trajectories/{jid}").json()
     assert len(traj["flights"][0]["trajectory"]) > 10
+    assert len(traj["flights"][0]["points_px"]) >= 20
+
+    rallies = client.get(f"/api/v1/rallies/{jid}").json()["rallies"]
+    assert len(rallies) >= 1
+    # оба паса лежат внутри своих розыгрышей
+    for fl in traj["flights"]:
+        assert any(r["start_frame"] <= fl["release_frame"] <= r["end_frame"]
+                   for r in rallies)
 
     jobs = client.get("/api/v1/jobs").json()
     assert any(x["id"] == jid for x in jobs)
+
+    # видео с отрисованными траекториями сформировано и отдаётся
+    detail = client.get(f"/api/v1/jobs/{jid}").json()
+    assert detail["has_result_video"]
+    v = client.get(f"/api/v1/jobs/{jid}/video")
+    assert v.status_code == 200
+    assert len(v.content) > 1000
 
 
 def test_rejects_non_video(client):
@@ -119,3 +140,4 @@ def test_rejects_non_video(client):
 
 def test_job_not_found(client):
     assert client.get("/api/v1/jobs/deadbeef").status_code == 404
+    assert client.get("/api/v1/rallies/deadbeef").status_code == 404

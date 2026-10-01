@@ -99,10 +99,65 @@ class Settings:
     drag_coefficient: float = 0.02     # безразмерный коэффициент сопротивления воздуха
     use_physics_fit: bool = True       # подгонять баллистическую модель к трек-данным
 
+    # --- VballNet (детекция мяча) + детекция пасов по траектории --------------
+    # Модель из https://github.com/asigatchov/fast-volleyball-tracking-inference
+    vballnet_path: str = os.getenv("BT_VBALLNET_PATH", "models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx")
+    heatmap_threshold: float = float(os.getenv("BT_HEATMAP_THRESHOLD", "0.5"))
+    # Розыгрыш: разрыв видимости мяча больше этого числа кадров закрывает эпизод.
+    rally_gap_frames: int = int(os.getenv("BT_RALLY_GAP", "15"))
+    # Параболические участки (свободный полёт): окно фита и допуски.
+    par_min_frames: int = int(os.getenv("BT_PAR_MIN_FRAMES", "6"))
+    par_max_frames: int = int(os.getenv("BT_PAR_MAX_FRAMES", "45"))
+    par_max_rmse_frac: float = float(os.getenv("BT_PAR_RMSE_FRAC", "0.03"))
+    # Эмпирическое гравитационное ускорение в px/s^2 = ratio * fps^2
+    # (подбирается под ракурс/масштаб съёмки; 0.55 — типовой зал).
+    gravity_fit_ratio: float = float(os.getenv("BT_GRAVITY_FIT_RATIO", "0.55"))
+    grav_tol_rel: float = float(os.getenv("BT_GRAV_TOL_REL", "0.75"))
+    # Минимальное горизонтальное перемещение участка (доля ширины кадра),
+    # отличающее настоящий перелёт «к сетке» от дребезга/ведения мяча.
+    min_horizontal_disp_frac: float = float(os.getenv("BT_MIN_DISP_FRAC", "0.06"))
+
+    # --- Фильтрация ложных детекций ------------------------------------------
+    # ЭТОТ ЖЕ явный небольшой epsilon управляет ДВУМЯ простыми правилами
+    # (pipeline.analyze_video → trajectory_filter):
+    #   1) remove_outliers: p_i — ЛОЖНАЯ детекция и просто выбрасывается, если
+    #        ||p_i-p_{i-1}|| > eps  И  ||p_i-p_{i+1}|| > eps
+    #        И  ||p_{i-1}-p_{i+1}|| <= eps      (соседки рядом, точка — телепорт)
+    #   2) split_track_by_jumps: если p_i далеко от p_{i-1}, а соседки ТОЖЕ не
+    #        рядом друг с другом — мяч честно быстро перелетел (атака/подача);
+    #        трек разрывается в этом месте: каждый кусок = отдельный розыгрыш.
+    #
+    # КАК НАСТРАИВАТЬ EPS: единственная переменная — BT_OUTLIER_EPS_PX (px).
+    #   Уменьшить — больше точек считается выбросами/разрезами (агрессивнее);
+    #   увеличить — мягче. По умолчанию 60 px (~3–5% высоты кадра 1080p, шаг
+    #   медленно летящего мяча обычно заметно меньше).
+    outlier_eps_px: float = float(os.getenv("BT_OUTLIER_EPS_PX", "60"))
+
+    # --- Отображение только части траектории ВЫШЕ сетки ------------------------
+    # Высота верхней ленты сетки — 243 см (женщины 224 см: BT_NET_TOP_HEIGHT_M).
+    # Уровень в пикселях: BT_NET_TOP_PX > 0 — явная отметка (надёжнее всего);
+    # иначе — ФИКСИРОВАННЫЙ типовой уровень трансляции BT_NET_AUTO_DEFAULT_FRAC*H
+    # (без «плавающей» автооценки по геометрии — она скакала от видео к видео).
+    # Уровень принимается только если трек его осмысляет: есть точки и выше, и
+    # ниже (BT_NET_AUTO_CHECK=1); иначе (сетки нет/плохо видна, мало точек) —
+    # лимит НЕ применяется, рисуется вся траектория.
+    # Применяется в pipeline.analyze_video: estimate_net_level + clip_track_above_net.
+    net_top_px: int = int(os.getenv("BT_NET_TOP_PX", "0"))          # явный уровень, px (0 → типовой)
+    net_top_height_m: float = float(os.getenv("BT_NET_TOP_HEIGHT_M", "2.43"))
+    only_above_net: bool = os.getenv("BT_ONLY_ABOVE_NET", "1") == "1"
+    net_auto_default_frac: float = float(os.getenv("BT_NET_AUTO_DEFAULT_FRAC", "0.65"))
+    net_auto_check: bool = os.getenv("BT_NET_AUTO_CHECK", "1") == "1"
+
     # --- Отрисовка траекторий поверх видео -------------------------------------
     render_tracked_video: bool = os.getenv("BT_RENDER_VIDEO", "1") == "1"
     trail_length: int = int(os.getenv("BT_TRAIL_LENGTH", "25"))  # «хвост» за мячом, точек
     render_dir: str = os.getenv("BT_RENDER_DIR", "data/renders")
+    # Режим отрисовки (диагностика гипотезы «баллистический фит не находится»):
+    #   "passes" — рисовать только траектории найденных пасов (по умолчанию);
+    #   "full"   — рисовать ПОЛНУЮ траекторию мяча (весь трек по всем розыгрышам)
+    #              ДО поиска параболических участков + все баллистические сег-
+    #              менты (и пасы «к сетке», и «от сетки») с их RMSE/grav-метками.
+    render_mode: str = os.getenv("BT_RENDER_MODE", "passes")
 
     # --- Хранилище ------------------------------------------------------------
     db_path: str = os.getenv("BT_DB_PATH", "data/balltime.db")
