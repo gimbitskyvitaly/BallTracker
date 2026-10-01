@@ -1,33 +1,40 @@
 """Фильтрация траектории мяча: ложные детекции и уровень сетки.
 
-1) ЛОЖНЫЕ ДЕТЕКЦИИ (изолированные выбросы). Точка p_i выбрасывается, если
-   она далеко от обеих соседок, а соседки близки друг к другу:
-       ||p_i - p_{i-1}|| > eps  AND  ||p_i - p_{i+1}|| > eps
-       AND ||p_{i-1} - p_{i+1}|| <= eps
-   Так отсекаются фоновые срабатывания heatmap-детектора (блики, текстуры),
-   которые «телепортируют» трек, не задевая реальных полётов: настоящая быстрая
-   точка мяча далёка ОТ СОСЕДКИ, но соседки при этом тоже далёки друг от друга
-   (условие не выполняется) — такие точки остаются.
+1) ЛОЖНЫЕ ДЕТЕКЦИИ (изолированные выбросы). Явный небольшой epsilon (px),
+   правило ровно из ТЗ:
+       p_i — ложная, если  ||p_i - p_{i-1}|| > eps  И  ||p_i - p_{i+1}|| > eps
+                            И ||p_{i-1} - p_{i+1}|| <= eps
+   т.е. соседки стоят «рядом» (мяч никуда не делся), а p_i телепортировалась —
+   это фоновое срабатывание heatmap-детектора (блик, текстура). Точка просто
+   выбрасывается.
 
-   eps по умолчанию авто: max_jump_px * dt_кадров между соседями + multiplier *
-   диаметр мяча. Максимальная линейная скорость волейбольного мяча ~40 м/с ≈
-   5 px/кадр при 240 fps для типовой съёмки; одиночные пропуски детекции
-   интерполируются ДО фильтра, поэтому dt обычно = 1 кадр.
+   ВАЖНОЕ отличие от «быстрого полёта»: если p_i далеко от p_{i-1}, а соседки
+   p_{i-1} и p_{i+1} тоже НЕ рядом друг с другом — значит мяч действительно
+   быстро перелетел (атака/подача). Такую точку НЕ удаляем; вместо этого трек
+   режется в этом месте на части (split_track_by_jumps): каждый кусок — это
+   отдельный розыгрыш, и дальше по нему пасы ищутся независимо.
 
 2) УРОВЕНЬ СЕТКИ (отображаем только части траектории выше сетки).
    Верхняя лента сетки в волейболе — 243 см (мужчины; 224 см — женщины).
-   Уровень в пикселях вычисляется из масштаба сцены:
-       scale_px_per_m = net_top_px / net_top_height_m
-   где scale оценивается по геометрии кадра (горизонт площадки → масштаб по
-   ширине, игроки → рост 1.90 м по вертикали). Если явный уровень не задан и
-   автооценка невозможна или неконсистентна (на видео нет сетки/площадки,
-   ракурс неизвестен) — ограничение НЕ применяется, рисуется вся траектория.
+   Автоопределение по треку мяча без разметки кадра (старая оценка была
+   нестабильна: на одном видео линия выше сетки, на другом «на земле», на
+   третьем ничего не задетектилось), поэтому теперь просто:
+     * явный уровень BT_NET_TOP_PX > 0 → используется он;
+     * иначе берётся ФИКСИРОВАННЫЙ типовой уровень трансляции
+       BT_NET_AUTO_DEFAULT_FRAC * H (для стандартного кадра волейбольной
+       трансляции верхняя лента ≈ 65% высоты);
+     * если включён фильтр согласованности BT_NET_AUTO_CHECK=1, то уровень
+       принимается только когда в треке есть точки как ВЫШЕ него (мяч летает
+       над сеткой — уровень имеет смысл), так и НИЖЕ него (мяч бывает у пола/
+       рук — трек реально пересекает зону игры). Если данных мало или трек
+       целиком по одну сторону — считаем, что сетку «не видно», лимит НЕ
+       применяется, рисуется вся траектория.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -35,25 +42,6 @@ BallPoint = tuple[int, float, float]          # (frame, x, y)
 
 
 # --------------------------------------------------------- ложные детекции
-def default_outlier_eps(fps: float, height: int, *, max_speed_px_s: float,
-                        ball_diam_mult: float, ball_diam_px: float) -> float:
-    """Авто-eps: максимальное честное перемещение между соседними точками трека
-    (v_max * dt_med) + запас на диаметр мяча.
-
-    max_speed_px_s — «разумный максимум» скорости мяча в px/сек (реальный
-    волейбольный мяч на типовой трансляции летит не быстрее ~1200 px/s);
-    пересчитывается в px/кадр через медианный шаг кадров трека (fps), поэтому
-    корректно работает и на 25 fps, и на 240 fps. Ограничиваем снизу диаметром
-    мяча (иначе шум детекции на медленных участках сам станет «выбросом») и
-    сверху долей высоты кадра — защита от абсурдных eps.
-    """
-    fps = max(fps, 1.0)
-    diam = max(ball_diam_px, 8.0)
-    per_frame = max_speed_px_s / fps
-    eps = max(per_frame, diam) + ball_diam_mult * diam
-    return min(eps, 0.25 * max(height, 1))
-
-
 def remove_outliers(points: list[BallPoint], eps: float
                     ) -> tuple[list[BallPoint], list[BallPoint]]:
     """Возвращает (чищенные точки, выброшенные ложные детекции).
@@ -94,13 +82,34 @@ def remove_outliers(points: list[BallPoint], eps: float
     return pts, removed
 
 
+def split_track_by_jumps(points: list[BallPoint], eps: float
+                         ) -> tuple[list[BallPoint], int]:
+    """Разрезает трек там, где мяч ЧЕСТНО быстро перелетел (атака/подача).
+
+    После remove_outliers любая пара соседних точек трека с расстоянием > eps
+    — это уже НЕ ложная детекция (одиночные «телепортации» удалены), а реальный
+    быстрый перелёт. По ТЗ такой момент означает начало нового розыгрыша,
+    поэтому трек разрывается ровно здесь. Возвращает (ПЕРВЫЙ кусок до прыжка,
+    1) либо (весь трек, 0) — вызывающий цикл забирает хвост rest[len(head):]
+    и повторяет, пока разрывы не кончатся.
+    """
+    if len(points) < 2 or eps <= 0:
+        return list(points), 0
+    pts = sorted(points, key=lambda p: p[0])
+    for i in range(len(pts) - 1):
+        a, b = pts[i], pts[i + 1]
+        if math.hypot(b[1] - a[1], b[2] - a[2]) > eps:
+            return pts[:i + 1], 1
+    return pts, 0
+
+
 # ------------------------------------------------------------- уровень сетки
 @dataclass
 class NetLevel:
     """Уровень ВЕРХНЕЙ ленты сетки в координатах кадра + обоснование оценки."""
     y_px: float                 # строка пикселей: выше сетки ⇔ y < y_px
     source: str                 # "manual" | "auto"
-    scale_px_per_m: float       # масштаб сцены, использованный при оценке
+    scale_px_per_m: float       # масштаб сцены (для manual: y_px / net_height_m)
     net_height_m: float         # физическая высота сетки (2.43 м по умолчанию)
     notes: str = ""
 
@@ -108,81 +117,47 @@ class NetLevel:
         return y <= self.y_px + margin_px
 
 
-@dataclass
-class CourtGeometry:
-    """Геометрия площадки, измеренная на кадре (для автооценки уровня сетки)."""
-    near_edge_y: float | None = None    # нижняя ближняя граница линии площади
-    far_edge_y: float | None = None     # верхняя дальняя граница той же зоны
-    width_m: float = 9.0                # ширина зоны между боковыми (9 м)
-    length_m: float = 9.0               # глубина половины (9 м)
-    player_height_m: float = 1.90
-    players_px: list[float] = field(default_factory=list)  # высоты игроков, px
-
-
-def _scale_from_court(geo: CourtGeometry, width_px: float) -> float | None:
-    """Горизонтальный масштаб px/м по линии площади (перспектива ⇒ берём ближнюю)."""
-    if geo.near_edge_y is None or width_px <= 0:
-        return None
-    # Ширина площадки 9 м проецируется примерно на всю ширину кадра у ближней
-    # границы; если кадр «режет» площадку — масштаб будет занижен, что даёт
-    # завышенный net_top_px (сетка ниже) — консервативноacceptable, т.к. мы всё
-    # равно проверяем консистентность с ростом игроков.
-    return width_px / geo.width_m
-
-
-def estimate_net_level(height: int, width: int, geo: CourtGeometry | None, *,
+def estimate_net_level(height: int, ball_points: list[BallPoint], *,
                        net_height_m: float, manual_y_px: float = 0.0,
-                       scale_min: float, scale_max: float) -> NetLevel | None:
-    """Оценка уровня верхней ленты сетки в px. None — определить невозможно.
+                       default_frac: float = 0.65,
+                       consistency_check: bool = True) -> NetLevel | None:
+    """Уровень верхней ленты сетки в px. None — определить невозможно.
 
     manual_y_px > 0 → явная отметка пользователя (BT_NET_TOP_PX).
-    Иначе авто: scale по площадке (горизонталь) сверяется со scale по росту
-    игроков (вертикаль); при расхождении >2x или отсутствии данных — None
-    («на некоторых видео сетки может не быть или она плохо видна» → лимит не
-    применяется, рисуем всю траекторию).
+    Иначе фиксированный типовой уровень трансляции default_frac*H (сетка
+    243 см ≈ 65% высоты кадра для стандартной камеры). Фильтр согласованности:
+    уровень принимается, только если трек мяча его «осмысляет» — есть точки
+    и выше, и ниже сетки (мяч пересекает зону игры). Мало точек / трек целиком
+    по одну сторону → сетку считать невидимой → None (лимит не применяется).
     """
     if manual_y_px and manual_y_px > 0:
-        # явная отметка пользователя НЕ проверяется scale_min/max (масштаб
-        # может быть любым из-за ракурса) — только физический смысл уровня
-        return NetLevel(y_px=float(manual_y_px), source="manual",
-                        scale_px_per_m=manual_y_px / net_height_m,
+        y = float(min(manual_y_px, height - 1))
+        return NetLevel(y_px=y, source="manual",
+                        scale_px_per_m=y / max(net_height_m, 1e-6),
                         net_height_m=net_height_m, notes="BT_NET_TOP_PX")
-    if geo is None:
-        return None
 
-    s_horiz = _scale_from_court(geo, width)
-    s_vert = None
-    if geo.players_px:
-        med_h = float(np.median(geo.players_px))
-        if med_h > 0:
-            s_vert = med_h / geo.player_height_m
-
-    candidates = [s for s in (s_horiz, s_vert) if s is not None]
-    if not candidates:
-        return None
-    if len(candidates) == 2:
-        a, b = candidates
-        if max(a, b) / max(min(a, b), 1e-6) > 2.0:
-            # геометрия неконсистентна (разные плоскости/ракурс) — не рискуем
-            return None
-        scale = math.sqrt(a * b)              # согласование двух оценок
-    else:
-        scale = candidates[0]
-    if not (scale_min <= scale <= scale_max):
-        return None
-    y_net = scale * net_height_m
-    if not (0.15 * height <= y_net <= 0.95 * height):
-        return None                            # абсурдный уровень — считаем, что не нашли
-    return NetLevel(y_px=y_net, source="auto", scale_px_per_m=scale,
+    y_net = float(np.clip(default_frac, 0.05, 0.98)) * height
+    if not consistency_check:
+        return NetLevel(y_px=y_net, source="auto",
+                        scale_px_per_m=y_net / max(net_height_m, 1e-6),
+                        net_height_m=net_height_m,
+                        notes=f"default {default_frac:.2f}*H, check off")
+    if len(ball_points) < 20:
+        return None                              # данных нет — не гадаем
+    ys = np.array([p[2] for p in ball_points], float)
+    frac_above = float((ys < y_net).mean())
+    if not (0.02 < frac_above < 0.98):
+        return None                              # весь трек по одну сторону —
+    return NetLevel(y_px=y_net, source="auto",   # уровень нам не виден
+                    scale_px_per_m=y_net / max(net_height_m, 1e-6),
                     net_height_m=net_height_m,
-                    notes=f"s_horiz={s_horiz and round(s_horiz,1)} "
-                         f"s_vert={s_vert and round(s_vert,1)}")
+                    notes=f"default {default_frac:.2f}*H, above={frac_above:.0%}")
 
 
 def clip_track_above_net(track: list[BallPoint], net: NetLevel | None, *,
                          min_points: int = 2
                          ) -> tuple[list[BallPoint], dict]:
-    """Оставляет только точки ВЫШЕ сетки (y <= net.y_px), разрывая трек на куски.
+    """Оставляет только точки ВЫШЕ сетки (y <= net.y_px).
 
     Точки ниже уровня сетки удаляются (мяч под сеткой/за линией лица нам неин-
     тересен при отображении). Возвращает (чищенный трек, статистику). Если net
@@ -200,55 +175,3 @@ def clip_track_above_net(track: list[BallPoint], net: NetLevel | None, *,
     if len(kept) < min_points:
         return [], stats
     return kept, stats
-
-
-# ------------------------------------------------ автооценка геометрии кадра
-def estimate_ground_y(ball_points: list[BallPoint]) -> float | None:
-    """Уровень «земли» (пол/руки игроков) по нижним огибающим точек мяча.
-
-    Мяч большую часть розыгрыша находится ВЫШЕ уровня игры руками (~1.5–2 м),
-    поэтому медиана y всех точек трека — устойчивая оценка горизонта игры;
-    берём перцентиль 0.85 (нижняя огибающая) как уровень земли y_g в px.
-    None — если данных мало (<20 точек).
-    """
-    if len(ball_points) < 20:
-        return None
-    ys = np.array([p[2] for p in ball_points], float)
-    return float(np.percentile(ys, 85.0))
-
-
-def auto_court_geometry(ball_points: list[BallPoint], height: int, *,
-                        ground_frac_lo: float, ground_frac_hi: float,
-                        player_height_frac: float
-                        ) -> CourtGeometry | None:
-    """CourtGeometry из одного только трека мяча (без разметки/детекции людей).
-
-    Пайплайн не детектирует линию площади и игроков, поэтому near_edge_y и
-    «рост игроков в px» напрямую взять неоткуда. Масштаб оцениваем по ДВУМ
-    якорям плоскости сетки:
-      * верхний якорь y_play = H * player_height_frac — типичная ВЕРХНЯЯ точка
-        полётов (пас/атака на уровне вытянутых рук ~2.0–2.4 м); для волейболь-
-        ной трансляции с потолком 5–7 м это 0.30–0.45H;
-      * нижний якорь y_g = перцентиль 0.85 y-координат трека — уровень игры у
-        земли (~0.6–1.2 м, приём/передача снизу).
-    Между ними ≈ player_height_m метров (разница высот рук над головой и
-    принятия мяча у пояса) ⇒ scale = (y_g − y_play)/player_height_m, а уровень
-    сетки 2.43 м лежит НАД верхним якорем: net_y = y_play − scale*(2.43 −
-    player_height_m + 0.45). При неконсистентности якорей (земля выше уровня
-    игры или слишком далеко) вернём None → estimate_net_level откажет и лимит
-    не применится («сетки нет / плохо видна»).
-    """
-    y_g = estimate_ground_y(ball_points)
-    if y_g is None:
-        return None
-    y_play = height * ground_frac_lo          # верхняя огибающая полётов
-    # земля должна быть НИЖЕ уровня игры и в разумных пределах кадра
-    if not (y_play < y_g < ground_frac_hi * height):
-        return None
-    span_px = max(y_g - y_play, 1.0)
-    scale = span_px / player_height_frac      # px на метр разницы высот якорей
-    return CourtGeometry(near_edge_y=None, far_edge_y=y_g,
-                         players_px=[scale * player_height_m_default])
-
-
-player_height_m_default = 1.90   # рост игрока, м (для перевода scale в px-«рост»)

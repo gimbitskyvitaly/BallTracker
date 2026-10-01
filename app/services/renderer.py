@@ -356,7 +356,9 @@ def _draw_full_trajectory(frame: np.ndarray, analysis, fid: int,
     lines = [
         f"MODE FULL  f{fid}/{analysis.n_frames}",
         f"track={len(track)} ({analysis.detection_rate:.0%}) rallies={len(analysis.rallies)}",
-        f"outliers removed={ro.get('n_removed', 0)} eps={ro.get('eps_px', '-')}px",
+        (f"eps={ro.get('eps_px', '-')}px: false removed={ro.get('n_removed', 0)}"
+         f" (+{ro.get('n_extra_removed', 0)}) | fast flights -> rally splits="
+         f"{ro.get('n_rally_splits', 0)}"),
         ("net clip: y=" + (f"{nc['net_y_px']}px ({nc['source']}) rm={nc['removed_below']}"
                            if nc.get("applied") else "NOT APPLIED (net not found)")),
         f"raw fits={diag.get('total_raw_fits', 0)} pass-filters={diag.get('total_would_pass', 0)}"

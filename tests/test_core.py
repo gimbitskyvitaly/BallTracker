@@ -429,3 +429,56 @@ class TestPipelineTrackBuilding:
         raw = [(1, 0.0, 0.0), (30, 100.0, 50.0)]
         trk = _interp_track(raw, gap_max=15)
         assert [p[0] for p in trk] == [1, 30], "долгий разрыв — граница розыгрыша"
+
+
+class TestTrajectoryFilter:
+    """Ложные детекции (один явный eps) + разрыв трека на розыгрыши + сетка."""
+
+    EPS = 60.0
+
+    def test_isolated_teleport_removed(self):
+        from app.services.trajectory_filter import remove_outliers
+        pts = [(i, float(i * 5), 100.0) for i in range(10)]
+        pts.insert(5, (5, 400.0, 400.0))            # ложная точка-телепорт
+        kept, dropped = remove_outliers(pts, self.EPS)
+        assert len(dropped) == 1 and len(kept) == 10
+        assert dropped[0][1] == 400.0
+
+    def test_fast_flight_not_removed_but_split(self):
+        """p_i далеко от p_{i-1}, соседки НЕ рядом → это атака/подача:
+        точку не выбрасываем, а трек режем — куски = разные розыгрыши."""
+        from app.services.trajectory_filter import (remove_outliers,
+                                                   split_track_by_jumps)
+        left = [(i, float(i * 5), 100.0) for i in range(5)]           # x 0..20
+        right = [(100 + i, 900.0 + i * 5, 300.0) for i in range(5)]  # после прыжка
+        pts = left + right
+        kept, dropped = remove_outliers(pts, self.EPS)
+        assert dropped == []                        # ничего не «ложное»
+        head, jumped = split_track_by_jumps(kept, self.EPS)
+        assert jumped == 1 and head == left         # разрез ровно в месте прыжка
+
+    def test_net_level_manual_and_fixed_default(self):
+        from app.services.trajectory_filter import estimate_net_level
+        mixed = [(i, 50.0, y) for i, y in enumerate([100] * 30 + [400] * 30)]
+        net = estimate_net_level(480, mixed, net_height_m=2.43, manual_y_px=216)
+        assert net is not None and net.source == "manual" and net.y_px == 216
+        net = estimate_net_level(480, mixed, net_height_m=2.43, manual_y_px=0,
+                                 default_frac=0.65)
+        assert net is not None and abs(net.y_px - 0.65 * 480) < 1e-6
+
+    def test_net_level_none_when_track_all_above(self):
+        """Весь трек выше типового уровня («сетку не видно») → None, лимит не
+        применяется (на некоторых видео сетки может не быть)."""
+        from app.services.trajectory_filter import estimate_net_level
+        high = [(i, 50.0, 100.0) for i in range(50)]
+        assert estimate_net_level(480, high, net_height_m=2.43) is None
+
+    def test_clip_above_net(self):
+        from app.services.trajectory_filter import (NetLevel,
+                                                    clip_track_above_net)
+        net = NetLevel(y_px=200.0, source="manual", scale_px_per_m=80.0,
+                       net_height_m=2.43)
+        track = [(0, 10.0, 150.0), (1, 20.0, 250.0), (2, 30.0, 120.0)]
+        kept, stats = clip_track_above_net(track, net)
+        assert [p[0] for p in kept] == [0, 2]
+        assert stats["removed_below"] == 1 and stats["applied"]
