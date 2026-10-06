@@ -1,0 +1,8 @@
+# NOTE: .env is intentionally NOT ignored — it ships with the service
+# as the single source of configuration (per project requirements).
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
