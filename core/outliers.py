@@ -54,26 +54,28 @@ def find_outlier_indices(points: Sequence[TrackPoint], eps: float) -> List[int]:
             bad.add(i)
 
     # --- chains of consecutive outliers ------------------------------------
-    # A run a..b (every jump from a-1 through b is > eps) is rejected when the
-    # endpoints surrounding the run are within eps of each other and every
-    # point of the run is farther than eps from *both* endpoints.  This rule
-    # never fires on genuine fast flights: if the ball keeps moving in the new
-    # region (attack / serve), some intermediate point stays close to the
-    # landing endpoint, so the "far from both endpoints" condition fails.
-    for a in range(1, n - 2):
-        if _dist(xy[a], xy[a - 1]) <= eps:
-            continue
-        b = a
-        while b + 1 < n and _dist(xy[b + 1], xy[b]) > eps:
-            b += 1
-        for end in range(a, min(b, n - 2) + 1):
-            if _dist(xy[a - 1], xy[end + 1]) >= eps:
-                continue
-            if all(
-                _dist(xy[k], xy[a - 1]) > eps and _dist(xy[k], xy[end + 1]) > eps
-                for k in range(a, end + 1)
-            ):
-                bad.update(range(a, end + 1))
+    # Iterative relaxation: remove the strict single-point outliers first,
+    # then re-evaluate the same rule on the reduced sequence.  After an
+    # isolated noise point is dropped, its noisy neighbours become adjacent to
+    # the clean context and are flagged by the very same criterion; a genuine
+    # fast flight (attack / serve) never matches, because after teleporting to
+    # the new region the ball *stays* there - the "came back within eps"
+    # condition cannot hold for its landing points.
+    remaining = [i for i in range(n) if i not in bad]
+    while len(remaining) >= 3:
+        m = len(remaining)
+        drop: set = set()
+        for j in range(1, m - 1):
+            i_prev, i, i_next = remaining[j - 1], remaining[j], remaining[j + 1]
+            d_prev = _dist(xy[i], xy[i_prev])
+            d_next = _dist(xy[i], xy[i_next])
+            d_neighbours = _dist(xy[i_prev], xy[i_next])
+            if d_prev > eps and d_next > eps and d_neighbours < eps:
+                drop.add(j)
+        if not drop:
+            break
+        bad.update(remaining[j] for j in drop)
+        remaining = [idx for j, idx in enumerate(remaining) if j not in drop]
 
     return sorted(bad)
 

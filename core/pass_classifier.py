@@ -27,11 +27,13 @@ from core.models import NetGeometry, PassEvent, Trajectory, TrackPoint
 
 
 def _fit_parabola(points: List[TrackPoint]) -> Tuple[np.ndarray, float]:
-    """Least-squares fit of y(t) = c0 + c1 t + c2 t^2, t in seconds.
+    """Least-squares fit of y(t) = c0 + c1 t + c2 t^2.
 
-    Time is normalised by the *mean frame spacing* (not the whole span), so
-    ``t`` is expressed in frames relative to the first point; this keeps the
-    fitted vertex position consistent for tracks with gaps.
+    ``t`` is the normalised time position along the trajectory, ``t in [0, 1]``
+    (frames rescaled by the mean spacing so tracks with gaps stay consistent).
+    With this parameterisation the fitted vertex sits at ``t_v = -c1 / (2 c2)``
+    directly on the [0, 1] axis and the curvature coefficient has an intuitive,
+    resolution-independent meaning.
     """
     t_raw = np.array([p.frame for p in points], dtype=np.float64)
     y = np.array([p.y for p in points], dtype=np.float64)
@@ -41,7 +43,8 @@ def _fit_parabola(points: List[TrackPoint]) -> Tuple[np.ndarray, float]:
         dt = 1.0
     if not np.isfinite(dt) or abs(dt) < 1e-9:
         dt = 1.0
-    t = (t_raw - t_raw[0]) / dt  # t in "frames" units, starts at 0
+    span_frames = max(float(t_raw[-1] - t_raw[0]), dt)
+    t = (t_raw - t_raw[0]) / (span_frames / dt)  # t in [0, 1]
     coeffs = np.polyfit(t, y, 2)
     residual = y - np.polyval(coeffs, t)
     rmse = float(np.sqrt(np.mean(residual ** 2)))
@@ -63,12 +66,12 @@ def _apex_of_arc(
     span = max(last - first, 1)
     ys = np.array([p.y for p in pts], dtype=np.float64)
     if curvature > 0 and len(pts) > 1:
-        dt = float(np.mean(np.diff([p.frame for p in pts]))) or 1.0
-        t_fit_frames = -coeffs[1] / (2.0 * curvature)  # in frame units
-        t_norm = t_fit_frames * dt / span
+        # t is normalised to [0, 1] by _fit_parabola, so the vertex position
+        # t_v = -c1 / (2*c2) is already on the trajectory time axis.
+        t_norm = -coeffs[1] / (2.0 * curvature)
         if 0.0 <= t_norm <= 1.0:
             return float(t_norm), first + t_norm * span, float(
-                np.polyval(coeffs, t_fit_frames)
+                np.polyval(coeffs, t_norm)
             )
     i = int(np.argmin(ys))  # screen y grows downwards -> min y is the apex
     t_obs = (pts[i].frame - first) / span
@@ -112,16 +115,13 @@ def classify_pass(
     # must be a real rise-and-fall (not a nearly straight segment): this is
     # what makes the shape "hyperbolic".  A monotonic climb/descent (attack,
     # serve flight captured between contacts) has its extremum at a boundary.
-    span_frames = max(pts[-1].frame - pts[0].frame, 1)
-    dt_mean = float(np.mean(np.diff([p.frame for p in pts]))) if len(pts) > 1 else 1.0
-    if not np.isfinite(dt_mean) or abs(dt_mean) < 1e-9:
-        dt_mean = 1.0
-    t_fit_norm = (-coeffs[1] / (2.0 * curvature)) * dt_mean / span_frames
+    # t is normalised to [0, 1], so the vertex sits at t_v = -c1 / (2*c2).
+    t_fit_norm = -coeffs[1] / (2.0 * curvature)
     if not (0.05 <= t_fit_norm <= 0.95):
         trajectory.reason = "not hyperbolic (apex at trajectory boundary)"
         return
     y_first, y_last = float(pts[0].y), float(pts[-1].y)
-    y_vertex = float(np.polyval(coeffs, t_fit_norm * span_frames / dt_mean))
+    y_vertex = float(np.polyval(coeffs, t_fit_norm))
     lift = max(y_first, y_last) - y_vertex
     if lift < 0.02 * max(frame_height, 1) or lift <= 0.0:
         trajectory.reason = "not hyperbolic (arc too flat / monotonic)"

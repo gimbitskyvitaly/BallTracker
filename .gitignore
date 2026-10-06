@@ -1,9 +1,5 @@
-# Python bytecode and cache
-__pycache__/
-*.pyc
-
 # Environment variables
 .env
 
-# Media files (video)
-*.mp4
+# Python package metadata (build artifacts)
+*.egg-info/
