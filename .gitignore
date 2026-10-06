@@ -1,5 +1,5 @@
-# Environment variables
-.env
+# NOTE: .env is intentionally NOT ignored — it ships with the service
+# as the single source of configuration (per project requirements).
 
 # Python package metadata (build artifacts)
 *.egg-info/
